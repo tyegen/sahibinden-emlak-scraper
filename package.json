@@ -1,7 +1,7 @@
 {
-    "name": "turkish-real-estate-scraper",
+    "name": "sahibinden-real-estate-scraper",
     "version": "1.0.0",
-    "description": "Turkish Real Estate Scraper (Sahibinden) - Puppeteer + Stealth (JavaScript ESM)",
+    "description": "Sahibinden Real Estate Scraper - Puppeteer + Stealth (JavaScript ESM)",
     "main": "src/main.js",
     "type": "module",
     "dependencies": {

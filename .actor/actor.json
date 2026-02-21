@@ -1,7 +1,7 @@
 {
     "actorSpecification": 1,
-    "name": "turkish-real-estate-scraper",
-    "title": "Turkish Real Estate Scraper (Sahibinden)",
+    "name": "sahibinden-real-estate-scraper",
+    "title": "Sahibinden Real Estate Scraper",
     "description": "Extract real estate listings (apartments, land, villas, etc.) from Turkey's largest property portal. Built with Puppeteer + Stealth to bypass Cloudflare and mandatory login screens using dynamic session cookies.",
     "version": "1.0",
     "meta": {

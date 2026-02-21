@@ -1,4 +1,4 @@
-# Turkish Real Estate Scraper (Sahibinden) 🏠
+# Sahibinden Real Estate Scraper 🏠
 
 A powerful Apify Actor that scrapes real estate listings from Sahibinden.com (Turkey's largest classified ads platform). Extracts property details including price, location, size, rooms, building age, and more.
 
@@ -106,7 +106,7 @@ const input = {
 };
 
 // Run the actor and wait for it to finish
-const run = await client.actor('YOUR_USERNAME/turkish-real-estate-scraper').call(input);
+const run = await client.actor('YOUR_USERNAME/sahibinden-real-estate-scraper').call(input);
 ```
 
 ### ⚠️ Important Notes
