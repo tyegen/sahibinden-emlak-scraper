@@ -479,6 +479,19 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             // Check maxItems limit
             if (maxItems !== null && scrapedItemsCount >= maxItems) {
                 log.info(`Maximum items limit (${maxItems}) reached. Stopping scrape.`);
+
+                // Push any currently collected results before aborting
+                if (results.length > 0) {
+                    await Actor.pushData(results);
+                    if (baseRowIntegration) {
+                        try {
+                            await baseRowIntegration.storeListings(results);
+                        } catch (error) {
+                            log.warning('Failed to store data in BaseRow', { error: error.message });
+                        }
+                    }
+                }
+
                 await crawler.autoscaledPool?.abort();
                 return;
             }
