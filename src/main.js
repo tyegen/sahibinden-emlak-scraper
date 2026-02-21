@@ -290,9 +290,79 @@ async function handleCategoryPage(page, request, enqueueLinks) {
     const nextPageSelector = 'a.prevNextBut[title="Sonraki"]:not(.passive)';
 
     try {
-        await page.waitForSelector(listingRowSelector, { timeout: 45000 });
+        // Try the main selector first
+        let listingElements = [];
+        try {
+            await page.waitForSelector(listingRowSelector, { timeout: 15000 });
+            listingElements = await page.$$(listingRowSelector);
+        } catch (e) {
+            log.warning(`Primary selector failed: ${listingRowSelector}`);
 
-        const listingElements = await page.$$(listingRowSelector);
+            // DEBUG: Capture page state for analysis
+            const pageTitle = await page.title().catch(() => 'unknown');
+            const currentUrl = page.url();
+            const bodyHTML = await page.$eval('body', el => el.innerHTML.substring(0, 3000)).catch(() => 'Could not get HTML');
+
+            log.info('DEBUG Page state:', { title: pageTitle, url: currentUrl });
+            log.info('DEBUG HTML preview (first 2000 chars):', { html: bodyHTML.substring(0, 2000) });
+
+            // Save screenshot to key-value store for debugging
+            try {
+                const screenshot = await page.screenshot({ fullPage: true, type: 'png' });
+                await Actor.setValue('DEBUG-screenshot', screenshot, { contentType: 'image/png' });
+                log.info('DEBUG: Screenshot saved to key-value store as "DEBUG-screenshot"');
+            } catch (screenshotErr) {
+                log.warning('Could not save debug screenshot');
+            }
+
+            // Try alternative selectors
+            const alternativeSelectors = [
+                'table.searchResultsTable tr.searchResultsItem',
+                '.searchResultsRowClass .searchResultsItem',
+                'tr.searchResultsItem',
+                '.classified-list-item',
+                '[data-id]',
+                '.searchResults .result-item',
+                'table tr[data-id]',
+            ];
+
+            for (const altSelector of alternativeSelectors) {
+                const altElements = await page.$$(altSelector);
+                if (altElements.length > 0) {
+                    log.info(`Found ${altElements.length} elements with alternative selector: ${altSelector}`);
+                    listingElements = altElements;
+                    break;
+                }
+            }
+
+            if (listingElements.length === 0) {
+                // Log all table elements on the page
+                const tableCount = await page.$$eval('table', tables => tables.length).catch(() => 0);
+                const trCount = await page.$$eval('tr', rows => rows.length).catch(() => 0);
+                const tbodyCount = await page.$$eval('tbody', bodies => bodies.length).catch(() => 0);
+                log.info('DEBUG: Page structure', { tables: tableCount, rows: trCount, tbodies: tbodyCount });
+
+                // Log all class names containing "search" or "result"
+                const searchClasses = await page.evaluate(() => {
+                    const allElements = document.querySelectorAll('*');
+                    const classes = new Set();
+                    allElements.forEach(el => {
+                        if (el.className && typeof el.className === 'string') {
+                            el.className.split(' ').forEach(cls => {
+                                if (cls.toLowerCase().includes('search') || cls.toLowerCase().includes('result') || cls.toLowerCase().includes('listing') || cls.toLowerCase().includes('classified')) {
+                                    classes.add(cls);
+                                }
+                            });
+                        }
+                    });
+                    return Array.from(classes);
+                }).catch(() => []);
+                log.info('DEBUG: Relevant CSS classes found:', { classes: searchClasses });
+
+                throw new Error('No listing elements found with any selector');
+            }
+        }
+
         log.info(`Found ${listingElements.length} listings on page.`);
 
         const results = [];
