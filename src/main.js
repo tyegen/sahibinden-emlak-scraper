@@ -37,20 +37,39 @@ const {
     baseRowDatabaseId,
 } = input;
 
+// Force RESIDENTIAL proxy with TR country code
+// Even if user provides partial proxy config, ensure RESIDENTIAL is used
+const finalProxyConfiguration = {
+    useApifyProxy: true,
+    apifyProxyGroups: ['RESIDENTIAL'],
+    countryCode: 'TR',
+    ...(proxyConfiguration || {}),
+};
+// Always ensure RESIDENTIAL is in the groups
+if (!finalProxyConfiguration.apifyProxyGroups || finalProxyConfiguration.apifyProxyGroups.length === 0) {
+    finalProxyConfiguration.apifyProxyGroups = ['RESIDENTIAL'];
+}
+if (!finalProxyConfiguration.countryCode) {
+    finalProxyConfiguration.countryCode = 'TR';
+}
+
 // Create the proxy configuration
-const proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
+const proxyConfig = await Actor.createProxyConfiguration(finalProxyConfiguration);
 
 log.info('Starting Sahibinden Emlak Scraper', {
     startUrls: startUrls.map(u => typeof u === 'string' ? u : u.url),
     maxItems,
     includeDetails,
     maxConcurrency,
+    proxyGroups: finalProxyConfiguration.apifyProxyGroups,
+    countryCode: finalProxyConfiguration.countryCode,
 });
 
 if (proxyConfig) {
     log.info('Using proxy configuration', {
         type: proxyConfig.usesApifyProxy ? 'Apify Proxy' : 'Custom Proxies',
-        groups: proxyConfig.apifyProxyGroups,
+        groups: finalProxyConfiguration.apifyProxyGroups,
+        country: finalProxyConfiguration.countryCode,
     });
 } else {
     log.warning('No proxy configuration specified. Sahibinden.com requires RESIDENTIAL proxy!');
@@ -240,6 +259,22 @@ const crawler = new PuppeteerCrawler({
         });
     },
 });
+
+// CRITICAL: Override Crawlee's internal blocked request check
+// Crawlee hardcodes 403 as "blocked" and throws BEFORE requestHandler runs,
+// even when our postNavigationHook successfully resolves the Cloudflare challenge.
+// We handle 403/503 ourselves in postNavigationHooks.
+const originalThrowOnBlocked = crawler._throwOnBlockedRequest?.bind(crawler);
+if (originalThrowOnBlocked) {
+    crawler._throwOnBlockedRequest = function (session, statusCode) {
+        if (statusCode === 403 || statusCode === 503) {
+            log.debug(`Suppressing Crawlee's built-in ${statusCode} block check (handled by postNavigationHook)`);
+            return;
+        }
+        return originalThrowOnBlocked(session, statusCode);
+    };
+    log.info('Overridden Crawlee blocked request check for Cloudflare compatibility');
+}
 
 // =============================================
 // CATEGORY PAGE HANDLER
