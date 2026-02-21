@@ -74,8 +74,24 @@ const crawler = new PuppeteerCrawler({
     proxyConfiguration: proxyConfig,
     maxConcurrency,
     maxRequestsPerCrawl: maxItems ? maxItems * 3 : 1000,
-    navigationTimeoutSecs: 60,
-    requestHandlerTimeoutSecs: 120,
+    maxRequestRetries: 8,
+    navigationTimeoutSecs: 90,
+    requestHandlerTimeoutSecs: 180,
+
+    // Session pool: persists cookies (including Cloudflare clearance) across requests
+    useSessionPool: true,
+    persistCookiesPerSession: true,
+    sessionPoolOptions: {
+        maxPoolSize: 10,
+        sessionOptions: {
+            maxUsageCount: 50,
+        },
+    },
+
+    browserPoolOptions: {
+        retireBrowserAfterPageCount: 20,
+    },
+
     launchContext: {
         launcher: puppeteer,
         launchOptions: {
@@ -85,6 +101,8 @@ const crawler = new PuppeteerCrawler({
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
+                '--window-size=1920,1080',
             ],
         },
         useChrome: false,
@@ -97,20 +115,82 @@ const crawler = new PuppeteerCrawler({
             await page.setExtraHTTPHeaders({
                 'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1',
             });
-            await page.setViewport({
-                width: 1366 + Math.floor(Math.random() * 200),
-                height: 768 + Math.floor(Math.random() * 200),
+
+            const width = 1366 + Math.floor(Math.random() * 400);
+            const height = 768 + Math.floor(Math.random() * 300);
+            await page.setViewport({ width, height });
+
+            // Override webdriver detection
+            await page.evaluateOnNewDocument(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['tr-TR', 'tr', 'en-US', 'en'] });
+                window.chrome = { runtime: {} };
             });
 
             if (gotoOptions) {
-                gotoOptions.waitUntil = 'domcontentloaded';
-                gotoOptions.timeout = 60000;
+                gotoOptions.waitUntil = 'networkidle2';
+                gotoOptions.timeout = 90000;
             }
         },
     ],
 
-    requestHandler: async ({ page, request, enqueueLinks }) => {
+    postNavigationHooks: [
+        async ({ page, response, request, session, log }) => {
+            const statusCode = response?.status();
+            log.info(`Response status: ${statusCode} for ${request.url}`);
+
+            // If we got 403, wait for Cloudflare challenge to resolve
+            if (statusCode === 403 || statusCode === 503) {
+                log.warning(`Got ${statusCode}, waiting for Cloudflare challenge to resolve...`);
+
+                // Wait for Cloudflare JS to execute and redirect
+                await randomDelay(5000, 10000);
+
+                // Check if we're on a Cloudflare challenge page
+                const content = await page.content();
+                if (
+                    content.includes('Just a moment') ||
+                    content.includes('Checking your browser') ||
+                    content.includes('cf-browser-verification') ||
+                    content.includes('challenge-platform')
+                ) {
+                    log.info('Cloudflare challenge page detected, waiting for resolution...');
+
+                    // Wait for navigation (Cloudflare auto-redirects after solving)
+                    try {
+                        await page.waitForNavigation({
+                            waitUntil: 'networkidle2',
+                            timeout: 30000,
+                        });
+                        log.info('Cloudflare challenge resolved!');
+                    } catch (e) {
+                        log.warning('Cloudflare challenge did not resolve in time. Retrying...');
+                        if (session) session.markBad();
+                        throw new Error('Cloudflare challenge timeout');
+                    }
+                } else {
+                    // True 403 block, mark session as bad and retry
+                    log.warning('Received 403 without Cloudflare challenge. Marking session as bad.');
+                    if (session) session.markBad();
+                    throw new Error(`Blocked with status ${statusCode}`);
+                }
+            }
+
+            // Validate we're on the right page
+            if (statusCode && statusCode >= 200 && statusCode < 300) {
+                if (session) session.markGood();
+            }
+        },
+    ],
+
+    requestHandler: async ({ page, request, enqueueLinks, session }) => {
         const label = request.userData?.label || 'CATEGORY';
         log.info(`Processing page [${label}]: ${request.url}`);
 
@@ -118,16 +198,23 @@ const crawler = new PuppeteerCrawler({
         await randomDelay(2000, 5000);
 
         try {
-            // Cloudflare check
+            // Additional Cloudflare check on page content
             const pageContent = await page.content();
             if (
                 pageContent.includes('Checking your browser') ||
                 pageContent.includes('cf-browser-verification') ||
                 pageContent.includes('Just a moment')
             ) {
-                log.warning('Cloudflare challenge detected, waiting...');
-                await randomDelay(5000, 10000);
-                await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => { });
+                log.warning('Cloudflare challenge still present in page, waiting...');
+                await randomDelay(8000, 15000);
+                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => { });
+
+                // Recheck
+                const newContent = await page.content();
+                if (newContent.includes('Just a moment') || newContent.includes('Checking your browser')) {
+                    if (session) session.markBad();
+                    throw new Error('Cloudflare challenge not resolved');
+                }
             }
 
             await page.waitForSelector('body', { timeout: 45000 });
