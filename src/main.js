@@ -114,17 +114,22 @@ const crawler = new PuppeteerCrawler({
     launchContext: {
         launcher: puppeteer,
         launchOptions: {
-            headless: true,
+            headless: process.env.HEADLESS !== 'false', // allow debugging with HEADLESS=false
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu',
                 '--disable-blink-features=AutomationControlled',
+                '--disable-infobars',
                 '--window-size=1920,1080',
+                '--start-maximized',
+                // Additional stealth flags
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-site-isolation-trials',
             ],
+            ignoreDefaultArgs: ['--enable-automation'],
         },
-        useChrome: false,
+        useChrome: true, // often better for stealth than chromium
     },
 
     preNavigationHooks: [
@@ -139,18 +144,81 @@ const crawler = new PuppeteerCrawler({
                 'Sec-Fetch-Site': 'none',
                 'Sec-Fetch-User': '?1',
                 'Upgrade-Insecure-Requests': '1',
+                'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
             });
 
-            const width = 1366 + Math.floor(Math.random() * 400);
-            const height = 768 + Math.floor(Math.random() * 300);
+            // Keep the viewport consistent with the window size to avoid detection
+            const width = 1920;
+            const height = 1080;
             await page.setViewport({ width, height });
 
-            // Override webdriver detection
+            // Advanced stealth overrides
             await page.evaluateOnNewDocument(() => {
-                Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                // Pass webdriver check
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                });
+
+                // Pass chrome check
+                window.chrome = {
+                    runtime: {},
+                    loadTimes: function () { },
+                    csi: function () { },
+                    app: {}
+                };
+
+                // Pass permissions check
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = parameters => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+
+                // Mock plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => {
+                        const plugins = [
+                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                            { name: 'Chrome PDF Viewer', filename: 'mhjimihiapuabedfglidnhagcfenogec', description: '' },
+                            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+                        ];
+
+                        // Add mock methods expected from the PluginArray
+                        plugins.item = (i) => plugins[i];
+                        plugins.namedItem = (name) => plugins.find(p => p.name === name);
+                        plugins.refresh = () => { };
+
+                        // Fake the iterator
+                        plugins[Symbol.iterator] = function* () {
+                            yield* Object.values(plugins);
+                        };
+
+                        // Inherit from PluginArray
+                        Object.setPrototypeOf(plugins, PluginArray.prototype);
+
+                        return plugins;
+                    }
+                });
+
+                // Mock languages
                 Object.defineProperty(navigator, 'languages', { get: () => ['tr-TR', 'tr', 'en-US', 'en'] });
-                window.chrome = { runtime: {} };
+
+                // Add dummy WebGL functions to thwart fingerprinting
+                const getParameter = WebGLRenderingContext.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function (parameter) {
+                    // UNMASKED_VENDOR_WEBGL
+                    if (parameter === 37445) {
+                        return 'Intel Inc.';
+                    }
+                    // UNMASKED_RENDERER_WEBGL
+                    if (parameter === 37446) {
+                        return 'Intel Iris OpenGL Engine';
+                    }
+                    return getParameter(parameter);
+                };
             });
 
             if (gotoOptions) {
@@ -166,11 +234,17 @@ const crawler = new PuppeteerCrawler({
             log.info(`Response status: ${statusCode} for ${request.url}`);
 
             // If we got 403, wait for Cloudflare challenge to resolve
-            if (statusCode === 403 || statusCode === 503) {
+            if (statusCode === 403 || statusCode === 503 || statusCode === 429) {
                 log.warning(`Got ${statusCode}, waiting for Cloudflare challenge to resolve...`);
 
                 // Wait for Cloudflare JS to execute and redirect
                 await randomDelay(5000, 10000);
+
+                // Simulate human movement
+                try {
+                    await page.mouse.move(100 + Math.random() * 500, 100 + Math.random() * 500);
+                    await page.mouse.move(200 + Math.random() * 500, 200 + Math.random() * 500);
+                } catch (e) { }
 
                 // Check if we're on a Cloudflare challenge page
                 const content = await page.content();
@@ -178,7 +252,9 @@ const crawler = new PuppeteerCrawler({
                     content.includes('Just a moment') ||
                     content.includes('Checking your browser') ||
                     content.includes('cf-browser-verification') ||
-                    content.includes('challenge-platform')
+                    content.includes('challenge-platform') ||
+                    content.includes('Güvenlik doğrulaması gerçekleştirme') ||
+                    content.includes('Uyumsuz tarayıcı eklentisi')
                 ) {
                     log.info('Cloudflare challenge page detected, waiting for resolution...');
 
@@ -186,7 +262,7 @@ const crawler = new PuppeteerCrawler({
                     try {
                         await page.waitForNavigation({
                             waitUntil: 'networkidle2',
-                            timeout: 30000,
+                            timeout: 45000, // increased timeout for solving
                         });
                         log.info('Cloudflare challenge resolved!');
                     } catch (e) {
@@ -196,7 +272,7 @@ const crawler = new PuppeteerCrawler({
                     }
                 } else {
                     // True 403 block, mark session as bad and retry
-                    log.warning('Received 403 without Cloudflare challenge. Marking session as bad.');
+                    log.warning('Received 403 without recognized Cloudflare challenge. Marking session as bad.');
                     if (session) session.markBad();
                     throw new Error(`Blocked with status ${statusCode}`);
                 }
