@@ -1,14 +1,11 @@
-# Sahibinden.com Emlak Scraper 🏠
-
-Sahibinden.com üzerindeki emlak ilanlarını (satılık daire, kiralık daire, arsa, villa vb.) otomatik olarak çeken Apify Actor.
-
-## 🇬🇧 English
+# Turkish Real Estate Scraper (Sahibinden) 🏠
 
 A powerful Apify Actor that scrapes real estate listings from Sahibinden.com (Turkey's largest classified ads platform). Extracts property details including price, location, size, rooms, building age, and more.
 
-### Features
+## Features
 
 - ✅ **Cloudflare Bypass** — Puppeteer + Stealth plugin
+- ✅ **Mandatory Login Bypass** — Supports injecting personal Session Cookies to evade IP login walls
 - ✅ **Residential Proxy** — Required for Sahibinden.com (TR country code)
 - ✅ **Detail Pages** — Optional: scrape full property details, photos, and seller info
 - ✅ **Pagination** — Automatically navigates through all result pages
@@ -87,9 +84,11 @@ https://www.sahibinden.com/satilik-daire/istanbul?sorting=date_desc&pagingSize=5
 ### Usage Example (API)
 
 ```javascript
-const Apify = require('apify');
+import { ApifyClient } from 'apify-client';
 
-const run = await Apify.call('YOUR_USERNAME/sahibinden-emlak-scraper', {
+const client = new ApifyClient({ token: 'YOUR_API_TOKEN' });
+
+const input = {
     startUrls: [
         { url: 'https://www.sahibinden.com/satilik-daire/istanbul?sorting=date_desc' }
     ],
@@ -100,47 +99,20 @@ const run = await Apify.call('YOUR_USERNAME/sahibinden-emlak-scraper', {
         useApifyProxy: true,
         apifyProxyGroups: ['RESIDENTIAL'],
         countryCode: 'TR'
-    }
-});
+    },
+    sessionCookies: [
+        // Paste your exported EditThisCookie JSON here
+    ]
+};
+
+// Run the actor and wait for it to finish
+const run = await client.actor('YOUR_USERNAME/turkish-real-estate-scraper').call(input);
 ```
 
 ### ⚠️ Important Notes
 
-- **RESIDENTIAL proxy is required** — Sahibinden.com blocks datacenter IPs
-- **Keep `maxConcurrency` at 3-5** — Higher values increase ban risk
-- **Country code `TR`** — Turkish residential proxies work best
-- **Selectors may change** — Sahibinden.com updates their HTML periodically
-
----
-
-## 🇹🇷 Türkçe
-
-### Özellikler
-
-- ✅ **Cloudflare Bypass** — Puppeteer + Stealth plugin ile
-- ✅ **Residential Proxy** — Sahibinden.com için zorunlu (TR)
-- ✅ **Detay Sayfaları** — Opsiyonel: tüm özellikler, fotoğraflar, ilan sahibi
-- ✅ **Sayfalama** — Otomatik olarak tüm sonuç sayfalarını gezer
-- ✅ **BaseRow Entegrasyonu** — Opsiyonel: verileri BaseRow'a kaydedin
-- ✅ **İnsan Davranışı** — Rastgele gecikmeler, user agent'lar
-
-### Kullanım
-
-1. Actor'ı Apify Store'dan çalıştırın
-2. `startUrls`'e Sahibinden.com emlak kategori sayfası ekleyin
-3. `maxItems` ile ilan limiti belirleyin
-4. Detaylı bilgi istiyorsanız `includeDetails: true` yapın
-5. Proxy olarak **RESIDENTIAL** seçin, ülke kodu **TR**
-
-### Fiyatlandırma
-
-| Mod | Fiyat | Açıklama |
-|-----|-------|----------|
-| Temel (Liste) | ~1000 ilan / $1 | Sadece liste verisi |
-| Detaylı | ~500 ilan / $1 | Liste + detay sayfası + fotoğraflar |
-
-### Proxy Maliyeti
-
-- RESIDENTIAL proxy: ~$12.5/GB
-- Tahmini kullanım: ~500 MB/ay
-- Aylık maliyet: ~$6
+- **Session Cookies are highly recommended** — Sahibinden.com frequently redirects scraper proxy IPs to the mandatory login page (`/giris`). You must provide your own exported Session Cookies to bypass this wall. **Do not save your cookies when publishing the actor publicly.** Provide them only when running your own tasks.
+- **RESIDENTIAL proxy is required** — Sahibinden.com blocks datacenter IPs.
+- **Keep `maxConcurrency` at 3-5** — Higher values increase the risk of your session cookies or proxy being banned.
+- **Country code `TR`** — Turkish residential proxies work best for latency and stealth.
+- **Selectors may change** — Sahibinden.com updates their HTML periodically to break automated extraction.
