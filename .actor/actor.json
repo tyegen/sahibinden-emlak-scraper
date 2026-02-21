@@ -1,0 +1,12 @@
+{
+    "actorSpecification": 1,
+    "name": "sahibinden-emlak-scraper",
+    "title": "Sahibinden.com Emlak Scraper",
+    "description": "Sahibinden.com üzerindeki emlak ilanlarını (satılık daire, kiralık daire, arsa, villa vb.) çeken güçlü bir scraper. Puppeteer + Stealth plugin ile Cloudflare korumasını aşar. Residential proxy desteği ile güvenilir çalışır.",
+    "version": "1.0",
+    "meta": {
+        "templateId": "js-crawlee-puppeteer-chrome"
+    },
+    "input": "./input_schema.json",
+    "dockerfile": "./Dockerfile"
+}
