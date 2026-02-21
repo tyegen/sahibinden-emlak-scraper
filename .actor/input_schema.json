@@ -56,6 +56,7 @@
             "title": "BaseRow API Token",
             "type": "string",
             "description": "Opsiyonel: BaseRow API token. Verileri BaseRow tablosuna kaydetmek için kullanılır.",
+            "editor": "textfield",
             "isSecret": true,
             "sectionCaption": "BaseRow Entegrasyonu (Opsiyonel)",
             "sectionDescription": "Verileri doğrudan BaseRow'a kaydetmek istiyorsanız bu alanları doldurun."
@@ -63,12 +64,14 @@
         "baseRowTableId": {
             "title": "BaseRow Table ID",
             "type": "string",
-            "description": "Opsiyonel: BaseRow tablo ID'si."
+            "description": "Opsiyonel: BaseRow tablo ID'si.",
+            "editor": "textfield"
         },
         "baseRowDatabaseId": {
             "title": "BaseRow Database ID",
             "type": "string",
-            "description": "Opsiyonel: BaseRow veritabanı ID'si."
+            "description": "Opsiyonel: BaseRow veritabanı ID'si.",
+            "editor": "textfield"
         }
     },
     "required": [
