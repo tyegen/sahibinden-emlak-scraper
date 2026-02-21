@@ -35,6 +35,8 @@ const {
     baseRowApiToken,
     baseRowTableId,
     baseRowDatabaseId,
+    // Session Cookies for login bypass
+    sessionCookies = [],
 } = input;
 
 // Force RESIDENTIAL proxy with TR country code
@@ -134,6 +136,26 @@ const crawler = new PuppeteerCrawler({
 
     preNavigationHooks: [
         async ({ page, request }, gotoOptions) => {
+            // Apply session cookies if provided
+            if (sessionCookies && Array.isArray(sessionCookies) && sessionCookies.length > 0) {
+                try {
+                    // Puppeteer expects cookies without generic attributes sometimes, formatting them
+                    const formattedCookies = sessionCookies.map(c => ({
+                        name: c.name,
+                        value: c.value,
+                        domain: c.domain || '.sahibinden.com',
+                        path: c.path || '/',
+                        secure: c.secure !== false,
+                        httpOnly: c.httpOnly === true,
+                        sameSite: c.sameSite || 'Lax'
+                    }));
+                    await page.setCookie(...formattedCookies);
+                    log.debug(`Injected ${formattedCookies.length} session cookies.`);
+                } catch (e) {
+                    log.warning(`Failed to inject session cookies: ${e.message}`);
+                }
+            }
+
             const ua = randomUserAgent();
             await page.setUserAgent(ua);
             await page.setExtraHTTPHeaders({
@@ -279,6 +301,16 @@ const crawler = new PuppeteerCrawler({
             }
 
             // Validate we're on the right page
+            const currentUrl = page.url();
+            if (currentUrl.includes('/giris') || currentUrl.includes('secure.sahibinden.com')) {
+                log.error('Redirected to login page. Your session cookies are missing or expired.');
+                if (session) session.markBad();
+
+                // We must abort the whole crawl if login is required but cookies are invalid,
+                // otherwise it'll just burn through proxies and retries uselessly.
+                throw new Error('Mandatory login required. Please update the sessionCookies input.');
+            }
+
             if (statusCode && statusCode >= 200 && statusCode < 300) {
                 if (session) session.markGood();
             }

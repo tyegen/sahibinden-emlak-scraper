@@ -72,6 +72,15 @@
             "type": "string",
             "description": "Opsiyonel: BaseRow veritabanı ID'si.",
             "editor": "textfield"
+        },
+        "sessionCookies": {
+            "title": "Session Cookies (JSON)",
+            "type": "array",
+            "description": "Sahibinden.com login engelini aşmak için tarayıcınızdan aldığınız (EditThisCookie vb.) aktif Cookie JSON verisini buraya yapıştırın.",
+            "editor": "json",
+            "default": [],
+            "sectionCaption": "Gelişmiş Ayarlar",
+            "sectionDescription": "Sahibinden login rotasından (sahibinden.com/giris) kurtulmak için kişisel hesap çerezlerinizi kullanın."
         }
     },
     "required": [
