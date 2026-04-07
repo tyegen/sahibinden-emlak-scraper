@@ -286,8 +286,27 @@ const crawler = new PuppeteerCrawler({
                             waitUntil: 'networkidle2',
                             timeout: 45000, // increased timeout for solving
                         });
+
+                        // Re-check: navigation completed but may have landed on another challenge page
+                        const resolvedContent = await page.content();
+                        const stillChallenged =
+                            resolvedContent.includes('Just a moment') ||
+                            resolvedContent.includes('Checking your browser') ||
+                            resolvedContent.includes('cf-browser-verification') ||
+                            resolvedContent.includes('challenge-platform') ||
+                            resolvedContent.includes('Güvenlik doğrulaması gerçekleştirme') ||
+                            resolvedContent.includes('Bir dakika lütfen') ||
+                            resolvedContent.includes('Uyumsuz tarayıcı eklentisi');
+
+                        if (stillChallenged) {
+                            log.warning('Cloudflare challenge navigated to another challenge page. Marking session bad.');
+                            if (session) session.markBad();
+                            throw new Error('Cloudflare Turnstile challenge requires manual verification');
+                        }
+
                         log.info('Cloudflare challenge resolved!');
                     } catch (e) {
+                        if (e.message.includes('Turnstile')) throw e;
                         log.warning('Cloudflare challenge did not resolve in time. Retrying...');
                         if (session) session.markBad();
                         throw new Error('Cloudflare challenge timeout');
@@ -339,19 +358,23 @@ const crawler = new PuppeteerCrawler({
 
         try {
             // Additional Cloudflare check on page content
+            const isChallengedPage = (html) =>
+                html.includes('Checking your browser') ||
+                html.includes('cf-browser-verification') ||
+                html.includes('Just a moment') ||
+                html.includes('Güvenlik doğrulaması gerçekleştirme') ||
+                html.includes('Bir dakika lütfen') ||
+                html.includes('challenge-platform');
+
             const pageContent = await page.content();
-            if (
-                pageContent.includes('Checking your browser') ||
-                pageContent.includes('cf-browser-verification') ||
-                pageContent.includes('Just a moment')
-            ) {
+            if (isChallengedPage(pageContent)) {
                 log.warning('Cloudflare challenge still present in page, waiting...');
                 await randomDelay(8000, 15000);
                 await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => { });
 
                 // Recheck
                 const newContent = await page.content();
-                if (newContent.includes('Just a moment') || newContent.includes('Checking your browser')) {
+                if (isChallengedPage(newContent)) {
                     if (session) session.markBad();
                     throw new Error('Cloudflare challenge not resolved');
                 }
