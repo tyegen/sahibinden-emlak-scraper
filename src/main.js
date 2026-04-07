@@ -135,7 +135,6 @@ const crawler = new PlaywrightCrawler({
     launchContext: {
         launchOptions: {
             headless: process.env.HEADLESS !== 'false',
-            channel: 'chrome', // use real installed Chrome for better fingerprint
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -147,7 +146,6 @@ const crawler = new PlaywrightCrawler({
                 '--disable-features=IsolateOrigins,site-per-process',
                 '--disable-site-isolation-trials',
             ],
-            ignoreDefaultArgs: ['--enable-automation'],
         },
     },
 
