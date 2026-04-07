@@ -120,16 +120,6 @@ const crawler = new PlaywrightCrawler({
 
     browserPoolOptions: {
         retireBrowserAfterPageCount: 20,
-        // Inject realistic browser fingerprints (canvas, WebGL, audio, screen)
-        // generated from real user data — much stronger than the old stealth plugin
-        fingerprintOptions: {
-            fingerprintGeneratorOptions: {
-                browsers: [{ name: 'chrome', minVersion: 120, maxVersion: 125 }],
-                devices: ['desktop'],
-                operatingSystems: ['windows'],
-                locales: ['tr-TR'],
-            },
-        },
     },
 
     launchContext: {
