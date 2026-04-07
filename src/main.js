@@ -35,6 +35,7 @@ const {
     baseRowTableId,
     baseRowDatabaseId,
     sessionCookies = [],
+    debugMode = false,
 } = input;
 
 // Force RESIDENTIAL proxy with TR country code
@@ -95,6 +96,32 @@ function isChallengedPage(html) {
     );
 }
 
+let debugCounter = 0;
+async function saveDebugInfo(page, label) {
+    if (!debugMode) return;
+    const idx = ++debugCounter;
+    const key = `DEBUG-${String(idx).padStart(3, '0')}-${label}`;
+    try {
+        const screenshot = await page.screenshot({ fullPage: true, type: 'png' });
+        await Actor.setValue(`${key}-screenshot`, screenshot, { contentType: 'image/png' });
+        log.info(`[DEBUG] Screenshot saved → KV store key: "${key}-screenshot"`);
+    } catch (e) {
+        log.warning(`[DEBUG] Could not save screenshot: ${e.message}`);
+    }
+    try {
+        const html = await page.content();
+        await Actor.setValue(`${key}-html`, html, { contentType: 'text/html' });
+        log.info(`[DEBUG] HTML saved → KV store key: "${key}-html" (${html.length} chars)`);
+    } catch (e) {
+        log.warning(`[DEBUG] Could not save HTML: ${e.message}`);
+    }
+    try {
+        const cookies = await page.cookies();
+        const cookieSummary = cookies.map(c => `${c.name}=${c.value.substring(0, 20)}... (expires: ${c.expires})`);
+        log.info(`[DEBUG] Cookies at "${label}":`, { cookies: cookieSummary });
+    } catch (e) { }
+}
+
 // Create the Puppeteer crawler
 const crawler = new PuppeteerCrawler({
     proxyConfiguration: proxyConfig,
@@ -138,12 +165,12 @@ const crawler = new PuppeteerCrawler({
     },
 
     preNavigationHooks: [
-        async ({ page, request }, gotoOptions) => {
+        async ({ page, request, session }, gotoOptions) => {
             // Inject session cookies — filter expired ones first.
             // Sending an expired cf_clearance to Cloudflare is worse than sending none.
+            const nowSecs = Date.now() / 1000;
             if (sessionCookies && Array.isArray(sessionCookies) && sessionCookies.length > 0) {
                 try {
-                    const nowSecs = Date.now() / 1000;
                     const validCookies = sessionCookies.filter(c => {
                         const expiry = c.expirationDate ?? c.expires ?? null;
                         if (expiry && expiry < nowSecs) {
@@ -174,6 +201,51 @@ const crawler = new PuppeteerCrawler({
                 } catch (e) {
                     log.warning(`Failed to inject session cookies: ${e.message}`);
                 }
+            }
+
+            // Check if we have a valid cf_clearance (from either input cookies or session pool)
+            const allCurrentCookies = await page.cookies('https://www.sahibinden.com').catch(() => []);
+            const hasValidCfClearance = allCurrentCookies.some(c => {
+                if (c.name !== 'cf_clearance') return false;
+                const expiry = c.expires ?? null;
+                return !expiry || expiry === -1 || expiry > nowSecs;
+            });
+
+            // Pre-warm: navigate to homepage BEFORE target URL to earn cf_clearance.
+            // Only runs once per session (tracked via session.userData.warmedUp).
+            if (!hasValidCfClearance && !session?.userData?.warmedUp) {
+                log.info('No valid cf_clearance found — pre-warming session via homepage...');
+                try {
+                    await page.goto('https://www.sahibinden.com', {
+                        waitUntil: 'networkidle2',
+                        timeout: 60000,
+                    });
+                    const warmContent = await page.content();
+                    if (isChallengedPage(warmContent)) {
+                        log.info('CF challenge on homepage during pre-warm, waiting for auto-resolution...');
+                        await saveDebugInfo(page, 'prewarm-challenge');
+                        try {
+                            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+                            const afterWarm = await page.content();
+                            if (isChallengedPage(afterWarm)) {
+                                log.warning('Pre-warm CF challenge did not resolve. Will attempt target URL anyway.');
+                                await saveDebugInfo(page, 'prewarm-challenge-unresolved');
+                            } else {
+                                log.info('Pre-warm CF challenge resolved.');
+                            }
+                        } catch (e) {
+                            log.warning(`Pre-warm CF challenge wait timed out: ${e.message}`);
+                        }
+                    } else {
+                        log.info('Pre-warm homepage loaded successfully (no challenge).');
+                    }
+                    if (session) session.userData = { ...session.userData, warmedUp: true };
+                    await randomDelay(1500, 3000);
+                } catch (e) {
+                    log.warning(`Session pre-warm failed: ${e.message}`);
+                }
+            } else if (hasValidCfClearance) {
+                log.debug('Valid cf_clearance present, skipping pre-warm.');
             }
 
             const ua = randomUserAgent();
@@ -265,7 +337,8 @@ const crawler = new PuppeteerCrawler({
             log.info(`Response status: ${statusCode} for ${request.url}`);
 
             if (statusCode === 403 || statusCode === 503 || statusCode === 429) {
-                log.warning(`Got ${statusCode}, waiting for Cloudflare challenge to resolve...`);
+                log.warning(`Got ${statusCode} for ${request.url} — checking page content...`);
+                await saveDebugInfo(page, `${statusCode}-initial`);
 
                 await randomDelay(5000, 10000);
 
@@ -276,7 +349,8 @@ const crawler = new PuppeteerCrawler({
 
                 const content = await page.content();
                 if (isChallengedPage(content)) {
-                    log.info('Cloudflare challenge page detected, waiting for resolution...');
+                    log.info('Cloudflare challenge page detected, waiting for auto-resolution...');
+                    await saveDebugInfo(page, `${statusCode}-challenge`);
                     try {
                         await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
 
@@ -284,6 +358,7 @@ const crawler = new PuppeteerCrawler({
                         const resolvedContent = await page.content();
                         if (isChallengedPage(resolvedContent)) {
                             log.warning('Cloudflare challenge navigated to another challenge page. Marking session bad.');
+                            await saveDebugInfo(page, `${statusCode}-challenge-still-blocked`);
                             if (session) session.markBad();
                             throw new Error('Cloudflare Turnstile challenge requires manual verification');
                         }
@@ -292,11 +367,13 @@ const crawler = new PuppeteerCrawler({
                     } catch (e) {
                         if (e.message.includes('Turnstile')) throw e;
                         log.warning('Cloudflare challenge did not resolve in time. Retrying...');
+                        await saveDebugInfo(page, `${statusCode}-challenge-timeout`);
                         if (session) session.markBad();
                         throw new Error('Cloudflare challenge timeout');
                     }
                 } else {
-                    log.warning('Received 403 without recognized Cloudflare challenge. Marking session as bad.');
+                    log.warning('Received 403 without recognized Cloudflare challenge page. Marking session as bad.');
+                    await saveDebugInfo(page, `${statusCode}-unknown-block`);
                     if (session) session.markBad();
                     throw new Error(`Blocked with status ${statusCode}`);
                 }
@@ -331,36 +408,6 @@ const crawler = new PuppeteerCrawler({
     requestHandler: async ({ page, request, enqueueLinks, session }) => {
         const label = request.userData?.label || 'CATEGORY';
         log.info(`Processing page [${label}]: ${request.url}`);
-
-        // Pre-warm: only when cf_clearance is missing or expired.
-        // If the user provided a valid cf_clearance, skip warmup and use it directly.
-        const nowSecs = Date.now() / 1000;
-        const hasValidCfClearance = sessionCookies.some(c => {
-            if (c.name !== 'cf_clearance') return false;
-            const expiry = c.expirationDate ?? c.expires ?? null;
-            return !expiry || expiry > nowSecs;
-        });
-
-        if (!hasValidCfClearance && !session?.userData?.warmedUp) {
-            log.info('No valid cf_clearance — warming up session via homepage...');
-            try {
-                await page.goto('https://www.sahibinden.com', {
-                    waitUntil: 'networkidle2',
-                    timeout: 60000,
-                });
-                const warmContent = await page.content();
-                if (isChallengedPage(warmContent)) {
-                    log.info('CF challenge on homepage during warm-up, waiting...');
-                    await randomDelay(5000, 10000);
-                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => { });
-                }
-                if (session) session.userData = { ...session.userData, warmedUp: true };
-                log.info('Session warm-up complete.');
-                await randomDelay(1500, 3000);
-            } catch (e) {
-                log.warning(`Session warm-up failed: ${e.message}`);
-            }
-        }
 
         await randomDelay(2000, 5000);
 
@@ -433,23 +480,14 @@ async function handleCategoryPage(page, request, enqueueLinks) {
         try {
             await page.waitForSelector(listingRowSelector, { timeout: 15000 });
             listingElements = await page.$$(listingRowSelector);
+            if (debugMode) await saveDebugInfo(page, 'category-loaded');
         } catch (e) {
             log.warning(`Primary selector failed: ${listingRowSelector}`);
 
             const pageTitle = await page.title().catch(() => 'unknown');
             const currentUrl = page.url();
-            const bodyHTML = await page.$eval('body', el => el.innerHTML.substring(0, 3000)).catch(() => 'Could not get HTML');
-
-            log.info('DEBUG Page state:', { title: pageTitle, url: currentUrl });
-            log.info('DEBUG HTML preview (first 2000 chars):', { html: bodyHTML.substring(0, 2000) });
-
-            try {
-                const screenshot = await page.screenshot({ fullPage: true, type: 'png' });
-                await Actor.setValue('DEBUG-screenshot', screenshot, { contentType: 'image/png' });
-                log.info('DEBUG: Screenshot saved to key-value store as "DEBUG-screenshot"');
-            } catch (screenshotErr) {
-                log.warning('Could not save debug screenshot');
-            }
+            log.info('Page state when selector failed:', { title: pageTitle, url: currentUrl });
+            await saveDebugInfo(page, 'category-selector-failed');
 
             const alternativeSelectors = [
                 'table.searchResultsTable tr.searchResultsItem',
