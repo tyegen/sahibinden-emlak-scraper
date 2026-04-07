@@ -122,23 +122,6 @@ const crawler = new PlaywrightCrawler({
         retireBrowserAfterPageCount: 20,
     },
 
-    launchContext: {
-        useChrome: true, // tells Crawlee to use the Chrome binary pre-installed in the Apify image
-        launchOptions: {
-            headless: process.env.HEADLESS !== 'false',
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-infobars',
-                '--window-size=1920,1080',
-                '--start-maximized',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-site-isolation-trials',
-            ],
-        },
-    },
 
     preNavigationHooks: [
         async ({ page, request }, gotoOptions) => {
