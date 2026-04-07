@@ -1,6 +1,8 @@
 // src/main.js - Sahibinden.com Emlak Scraper
 import { Actor } from 'apify';
-import { PlaywrightCrawler, log } from 'crawlee';
+import { PuppeteerCrawler, log } from 'crawlee';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import {
     randomUserAgent,
     randomDelay,
@@ -10,6 +12,9 @@ import {
     extractListingId,
 } from './utils.js';
 import { createBaseRowIntegration } from './baserow.js';
+
+// Apply the stealth plugin to puppeteer
+puppeteer.use(StealthPlugin());
 
 // Initialize the Apify Actor
 await Actor.init();
@@ -77,16 +82,7 @@ try {
 
 let scrapedItemsCount = 0;
 
-// Normalize sameSite values from browser export formats to Playwright-accepted values
-function normalizeSameSite(value) {
-    if (!value) return 'Lax';
-    const lower = value.toLowerCase();
-    if (lower === 'strict') return 'Strict';
-    if (lower === 'none' || lower === 'no_restriction') return 'None';
-    return 'Lax';
-}
-
-// Check if page content indicates a bot challenge
+// Check if page content is a bot challenge page
 function isChallengedPage(html) {
     return (
         html.includes('Just a moment') ||
@@ -99,16 +95,15 @@ function isChallengedPage(html) {
     );
 }
 
-// Create the Playwright crawler
-const crawler = new PlaywrightCrawler({
+// Create the Puppeteer crawler
+const crawler = new PuppeteerCrawler({
     proxyConfiguration: proxyConfig,
     maxConcurrency,
     maxRequestsPerCrawl: maxItems ? maxItems * 3 : 1000,
-    maxRequestRetries: 5,
+    maxRequestRetries: 8,
     navigationTimeoutSecs: 90,
     requestHandlerTimeoutSecs: 180,
 
-    // Session pool: persists cookies (including Cloudflare clearance) across requests
     useSessionPool: true,
     persistCookiesPerSession: true,
     sessionPoolOptions: {
@@ -123,39 +118,44 @@ const crawler = new PlaywrightCrawler({
     },
 
     launchContext: {
+        launcher: puppeteer,
         launchOptions: {
-            headless: true,
+            headless: process.env.HEADLESS !== 'false',
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu',
                 '--disable-blink-features=AutomationControlled',
+                '--disable-infobars',
+                '--window-size=1920,1080',
+                '--start-maximized',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-site-isolation-trials',
             ],
+            ignoreDefaultArgs: ['--enable-automation'],
         },
+        useChrome: true,
     },
-
 
     preNavigationHooks: [
         async ({ page, request }, gotoOptions) => {
-            // Inject session cookies before navigation so they are sent with the first request.
-            // Filter out expired cookies — sending an expired cf_clearance to Cloudflare
-            // is treated as a bad/suspicious request and makes detection worse.
+            // Inject session cookies — filter expired ones first.
+            // Sending an expired cf_clearance to Cloudflare is worse than sending none.
             if (sessionCookies && Array.isArray(sessionCookies) && sessionCookies.length > 0) {
                 try {
                     const nowSecs = Date.now() / 1000;
                     const validCookies = sessionCookies.filter(c => {
                         const expiry = c.expirationDate ?? c.expires ?? null;
                         if (expiry && expiry < nowSecs) {
-                            log.debug(`Skipping expired cookie: ${c.name} (expired ${new Date(expiry * 1000).toISOString()})`);
+                            log.debug(`Skipping expired cookie: ${c.name}`);
                             return false;
                         }
                         return true;
                     });
 
                     if (validCookies.length < sessionCookies.length) {
-                        log.warning(`Filtered out ${sessionCookies.length - validCookies.length} expired cookies. ` +
-                            `If cf_clearance expired, the scraper will try to earn a fresh one via session pre-warm.`);
+                        log.warning(`Filtered ${sessionCookies.length - validCookies.length} expired cookies. ` +
+                            `If cf_clearance expired, the scraper will earn a fresh one via session pre-warm.`);
                     }
 
                     if (validCookies.length > 0) {
@@ -166,9 +166,9 @@ const crawler = new PlaywrightCrawler({
                             path: c.path || '/',
                             secure: c.secure !== false,
                             httpOnly: c.httpOnly === true,
-                            sameSite: normalizeSameSite(c.sameSite),
+                            sameSite: c.sameSite === 'no_restriction' ? 'None' : (c.sameSite || 'Lax'),
                         }));
-                        await page.context().addCookies(formattedCookies);
+                        await page.setCookie(...formattedCookies);
                         log.debug(`Injected ${formattedCookies.length} valid session cookies.`);
                     }
                 } catch (e) {
@@ -176,6 +176,8 @@ const crawler = new PlaywrightCrawler({
                 }
             }
 
+            const ua = randomUserAgent();
+            await page.setUserAgent(ua);
             await page.setExtraHTTPHeaders({
                 'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -189,14 +191,12 @@ const crawler = new PlaywrightCrawler({
                 'sec-ch-ua-platform': '"Windows"',
             });
 
-            await page.setViewportSize({ width: 1920, height: 1080 });
+            await page.setViewport({ width: 1920, height: 1080 });
 
-            // Stealth init script — runs in page context before any page JS
-            await page.addInitScript(() => {
-                // Hide webdriver
+            // Stealth overrides — run before any page JS
+            await page.evaluateOnNewDocument(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-                // Mock Chrome runtime
                 window.chrome = {
                     runtime: {},
                     loadTimes: function () { },
@@ -204,7 +204,6 @@ const crawler = new PlaywrightCrawler({
                     app: {},
                 };
 
-                // Fix permissions API
                 const originalQuery = window.navigator.permissions.query;
                 window.navigator.permissions.query = parameters => (
                     parameters.name === 'notifications'
@@ -219,17 +218,42 @@ const crawler = new PlaywrightCrawler({
                 Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
                 Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
 
-                // Consistent screen properties matching the viewport
+                // Screen properties consistent with viewport
                 Object.defineProperty(screen, 'width', { get: () => 1920 });
                 Object.defineProperty(screen, 'height', { get: () => 1080 });
                 Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
                 Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
                 Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
                 Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+
+                // Mock plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => {
+                        const plugins = [
+                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                            { name: 'Chrome PDF Viewer', filename: 'mhjimihiapuabedfglidnhagcfenogec', description: '' },
+                            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+                        ];
+                        plugins.item = (i) => plugins[i];
+                        plugins.namedItem = (name) => plugins.find(p => p.name === name);
+                        plugins.refresh = () => { };
+                        plugins[Symbol.iterator] = function* () { yield* Object.values(plugins); };
+                        Object.setPrototypeOf(plugins, PluginArray.prototype);
+                        return plugins;
+                    },
+                });
+
+                // WebGL fingerprint
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function (parameter) {
+                    if (parameter === 37445) return 'Intel Inc.';
+                    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                    return getParameter.call(this, parameter);
+                };
             });
 
             if (gotoOptions) {
-                gotoOptions.waitUntil = 'networkidle';
+                gotoOptions.waitUntil = 'networkidle2';
                 gotoOptions.timeout = 90000;
             }
         },
@@ -240,13 +264,11 @@ const crawler = new PlaywrightCrawler({
             const statusCode = response?.status();
             log.info(`Response status: ${statusCode} for ${request.url}`);
 
-            // Handle Cloudflare challenge (403/503/429)
             if (statusCode === 403 || statusCode === 503 || statusCode === 429) {
                 log.warning(`Got ${statusCode}, waiting for Cloudflare challenge to resolve...`);
 
                 await randomDelay(5000, 10000);
 
-                // Simulate human mouse movement
                 try {
                     await page.mouse.move(100 + Math.random() * 500, 100 + Math.random() * 500);
                     await page.mouse.move(200 + Math.random() * 500, 200 + Math.random() * 500);
@@ -256,7 +278,7 @@ const crawler = new PlaywrightCrawler({
                 if (isChallengedPage(content)) {
                     log.info('Cloudflare challenge page detected, waiting for resolution...');
                     try {
-                        await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 45000 });
+                        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
 
                         // Re-check: navigation may have landed on another challenge page
                         const resolvedContent = await page.content();
@@ -280,11 +302,11 @@ const crawler = new PlaywrightCrawler({
                 }
             }
 
-            // Detect tloading page (200 response but JS redirect page)
+            // Detect tloading page (200 but JS redirect page)
             if (page.url().includes('/cs/tloading')) {
                 log.info('Detected tloading protection page, waiting for JS redirect...');
                 try {
-                    await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 });
+                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
                     log.info(`tloading resolved, now at: ${page.url()}`);
                 } catch (e) {
                     log.warning('tloading page did not redirect in time. Marking session bad and retrying.');
@@ -310,9 +332,8 @@ const crawler = new PlaywrightCrawler({
         const label = request.userData?.label || 'CATEGORY';
         log.info(`Processing page [${label}]: ${request.url}`);
 
-        // Pre-warm: navigate to the homepage to earn a fresh cf_clearance for this
-        // proxy session. Only needed when the user's cf_clearance cookie is missing
-        // or expired — if they provided a valid one, skip the warmup entirely.
+        // Pre-warm: only when cf_clearance is missing or expired.
+        // If the user provided a valid cf_clearance, skip warmup and use it directly.
         const nowSecs = Date.now() / 1000;
         const hasValidCfClearance = sessionCookies.some(c => {
             if (c.name !== 'cf_clearance') return false;
@@ -321,17 +342,17 @@ const crawler = new PlaywrightCrawler({
         });
 
         if (!hasValidCfClearance && !session?.userData?.warmedUp) {
-            log.info('New session — warming up via homepage...');
+            log.info('No valid cf_clearance — warming up session via homepage...');
             try {
                 await page.goto('https://www.sahibinden.com', {
-                    waitUntil: 'networkidle',
+                    waitUntil: 'networkidle2',
                     timeout: 60000,
                 });
                 const warmContent = await page.content();
                 if (isChallengedPage(warmContent)) {
-                    log.info('CF challenge on homepage, waiting for resolution...');
+                    log.info('CF challenge on homepage during warm-up, waiting...');
                     await randomDelay(5000, 10000);
-                    await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => { });
+                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => { });
                 }
                 if (session) session.userData = { ...session.userData, warmedUp: true };
                 log.info('Session warm-up complete.');
@@ -344,12 +365,11 @@ const crawler = new PlaywrightCrawler({
         await randomDelay(2000, 5000);
 
         try {
-            // Extra challenge check inside the handler
             const pageContent = await page.content();
             if (isChallengedPage(pageContent)) {
                 log.warning('Bot challenge still present in page, waiting...');
                 await randomDelay(8000, 15000);
-                await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => { });
+                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => { });
 
                 const newContent = await page.content();
                 if (isChallengedPage(newContent)) {
@@ -383,8 +403,6 @@ const crawler = new PlaywrightCrawler({
 });
 
 // CRITICAL: Override Crawlee's internal blocked request check
-// Crawlee hardcodes 403 as "blocked" and throws BEFORE requestHandler runs.
-// We handle 403/503 ourselves in postNavigationHooks.
 const originalThrowOnBlocked = crawler._throwOnBlockedRequest?.bind(crawler);
 if (originalThrowOnBlocked) {
     crawler._throwOnBlockedRequest = function (session, statusCode) {
@@ -489,9 +507,7 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                 if (results.length > 0) {
                     await Actor.pushData(results);
                     if (baseRowIntegration) {
-                        try {
-                            await baseRowIntegration.storeListings(results);
-                        } catch (error) {
+                        try { await baseRowIntegration.storeListings(results); } catch (error) {
                             log.warning('Failed to store data in BaseRow', { error: error.message });
                         }
                     }
@@ -512,21 +528,13 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                 }
 
                 const priceText = await element.$eval(priceSelector, el => el.textContent?.trim()).catch(() => null);
-
-                const location = await element.$eval(locationSelector, el => {
-                    return el.innerText?.trim().replace(/\n/g, ' / ');
-                }).catch(() => null);
-
-                const date = await element.$eval(dateSelector, el => {
-                    return el.innerText?.trim().replace(/\n/g, ' ');
-                }).catch(() => null);
-
+                const location = await element.$eval(locationSelector, el => el.innerText?.trim().replace(/\n/g, ' / ')).catch(() => null);
+                const date = await element.$eval(dateSelector, el => el.innerText?.trim().replace(/\n/g, ' ')).catch(() => null);
                 const image = await element.$eval('img', el => el.src || el.dataset?.src || null).catch(() => null);
-
                 const id = extractListingId(detailUrl);
 
                 const listingData = {
-                    id: id,
+                    id,
                     url: detailUrl,
                     title: normalizeText(title),
                     price: formatPrice(priceText),
@@ -534,7 +542,7 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                     price_raw: priceText,
                     location: normalizeText(location),
                     date: normalizeText(date),
-                    image: image,
+                    image,
                     scrapedAt: new Date().toISOString(),
                     sourceUrl: request.url,
                 };
@@ -542,10 +550,7 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                 if (includeDetails && detailUrl) {
                     await enqueueLinks({
                         urls: [detailUrl],
-                        userData: {
-                            label: 'DETAIL',
-                            listingData: listingData,
-                        },
+                        userData: { label: 'DETAIL', listingData },
                     });
                 } else {
                     results.push(listingData);
@@ -563,9 +568,7 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             log.info(`Pushed ${results.length} listings from page. Total scraped: ${scrapedItemsCount}`);
 
             if (baseRowIntegration) {
-                try {
-                    await baseRowIntegration.storeListings(results);
-                } catch (error) {
+                try { await baseRowIntegration.storeListings(results); } catch (error) {
                     log.warning('Failed to store data in BaseRow', { error: error.message });
                 }
             }
@@ -583,10 +586,7 @@ async function handleCategoryPage(page, request, enqueueLinks) {
         if (nextPageUrl) {
             log.info(`Enqueueing next category page: ${nextPageUrl}`);
             const absoluteNextPageUrl = new URL(nextPageUrl, request.loadedUrl || request.url).toString();
-            await enqueueLinks({
-                urls: [absoluteNextPageUrl],
-                userData: { label: 'CATEGORY' },
-            });
+            await enqueueLinks({ urls: [absoluteNextPageUrl], userData: { label: 'CATEGORY' } });
             await randomDelay(1000, 3000);
         } else {
             log.info(`No next page button found on ${request.url}`);
@@ -610,9 +610,7 @@ async function handleDetailPage(page, request) {
         await page.waitForSelector('body', { timeout: 30000 });
         await randomDelay(1000, 3000);
 
-        const description = await page.$eval('#classifiedDescription', el => {
-            return el.textContent?.trim() || '';
-        }).catch(() => '');
+        const description = await page.$eval('#classifiedDescription', el => el.textContent?.trim() || '').catch(() => '');
 
         const info = {};
         try {
@@ -620,9 +618,7 @@ async function handleDetailPage(page, request) {
             for (const item of infoItems) {
                 const label = await item.$eval('strong', el => el.textContent?.trim()).catch(() => null);
                 const value = await item.$eval('span', el => el.textContent?.trim()).catch(() => null);
-                if (label && value) {
-                    info[normalizeText(label)] = normalizeText(value);
-                }
+                if (label && value) info[normalizeText(label)] = normalizeText(value);
             }
         } catch (e) {
             log.debug('Could not extract info list', { error: e.message });
@@ -640,10 +636,7 @@ async function handleDetailPage(page, request) {
             el => el.textContent?.trim()
         ).catch(() => null);
 
-        const pageId = await page.$eval(
-            '.classifiedId',
-            el => el.textContent?.replace(/[^0-9]/g, '')
-        ).catch(() => null);
+        const pageId = await page.$eval('.classifiedId', el => el.textContent?.replace(/[^0-9]/g, '')).catch(() => null);
 
         const completeData = {
             ...listingData,
@@ -651,7 +644,7 @@ async function handleDetailPage(page, request) {
             description: normalizeText(description),
             images: uniqueImages,
             seller: seller ? normalizeText(seller) : null,
-            info: info,
+            info,
             size: info['Brüt / Net M2'] || info['m² (Brüt)'] || info['m² (Net)'] || null,
             rooms: info['Oda Sayısı'] || null,
             buildingAge: info['Bina Yaşı'] || null,
@@ -671,9 +664,7 @@ async function handleDetailPage(page, request) {
         log.info(`Pushed detail data for listing ${completeData.id}. Total scraped: ${scrapedItemsCount}`);
 
         if (baseRowIntegration) {
-            try {
-                await baseRowIntegration.storeListing(completeData);
-            } catch (error) {
+            try { await baseRowIntegration.storeListing(completeData); } catch (error) {
                 log.warning('Failed to store detail data in BaseRow', { error: error.message });
             }
         }
@@ -686,7 +677,6 @@ async function handleDetailPage(page, request) {
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         log.warning(`Could not handle detail page ${request.url}: ${errorMessage}`);
-
         if (listingData.title) {
             await Actor.pushData(listingData);
             scrapedItemsCount++;
