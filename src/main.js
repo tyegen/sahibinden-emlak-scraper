@@ -529,19 +529,6 @@ const crawler = new PuppeteerCrawler({
         await randomDelay(2000, 5000);
 
         try {
-            const pageContent = await page.content();
-            if (isChallengedPage(pageContent)) {
-                log.warning('Bot challenge still present in page, waiting...');
-                await randomDelay(8000, 15000);
-                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => { });
-
-                const newContent = await page.content();
-                if (isChallengedPage(newContent)) {
-                    if (session) session.markBad();
-                    throw new Error('Bot challenge not resolved');
-                }
-            }
-
             await page.waitForSelector('body', { timeout: 45000 });
 
             if (label === 'DETAIL') {
