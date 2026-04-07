@@ -130,6 +130,7 @@ const crawler = new PlaywrightCrawler({
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
             ],
         },
     },
@@ -173,8 +174,10 @@ const crawler = new PlaywrightCrawler({
 
             // Stealth init script — runs in page context before any page JS
             await page.addInitScript(() => {
+                // Hide webdriver
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
+                // Mock Chrome runtime
                 window.chrome = {
                     runtime: {},
                     loadTimes: function () { },
@@ -182,6 +185,7 @@ const crawler = new PlaywrightCrawler({
                     app: {},
                 };
 
+                // Fix permissions API
                 const originalQuery = window.navigator.permissions.query;
                 window.navigator.permissions.query = parameters => (
                     parameters.name === 'notifications'
@@ -189,9 +193,20 @@ const crawler = new PlaywrightCrawler({
                         : originalQuery(parameters)
                 );
 
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['tr-TR', 'tr', 'en-US', 'en'],
-                });
+                // Realistic navigator properties (PerimeterX checks these)
+                Object.defineProperty(navigator, 'languages', { get: () => ['tr-TR', 'tr', 'en-US', 'en'] });
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+
+                // Consistent screen properties matching the viewport
+                Object.defineProperty(screen, 'width', { get: () => 1920 });
+                Object.defineProperty(screen, 'height', { get: () => 1080 });
+                Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+                Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+                Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+                Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
             });
 
             if (gotoOptions) {
@@ -275,6 +290,31 @@ const crawler = new PlaywrightCrawler({
     requestHandler: async ({ page, request, enqueueLinks, session }) => {
         const label = request.userData?.label || 'CATEGORY';
         log.info(`Processing page [${label}]: ${request.url}`);
+
+        // Pre-warm new sessions via the homepage to earn a cf_clearance cookie
+        // on the proxy's own IP before hitting category/detail pages.
+        // cf_clearance is IP-bound, so we can't reuse the user's browser cookie —
+        // we need to earn one fresh on each proxy session.
+        if (!session?.userData?.warmedUp) {
+            log.info('New session — warming up via homepage...');
+            try {
+                await page.goto('https://www.sahibinden.com', {
+                    waitUntil: 'networkidle',
+                    timeout: 60000,
+                });
+                const warmContent = await page.content();
+                if (isChallengedPage(warmContent)) {
+                    log.info('CF challenge on homepage, waiting for resolution...');
+                    await randomDelay(5000, 10000);
+                    await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => { });
+                }
+                if (session) session.userData = { ...session.userData, warmedUp: true };
+                log.info('Session warm-up complete.');
+                await randomDelay(1500, 3000);
+            } catch (e) {
+                log.warning(`Session warm-up failed: ${e.message}`);
+            }
+        }
 
         await randomDelay(2000, 5000);
 
