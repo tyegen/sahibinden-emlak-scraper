@@ -54,6 +54,8 @@ if (!finalProxyConfiguration.countryCode) {
 
 const proxyConfig = await Actor.createProxyConfiguration(finalProxyConfiguration);
 
+const cookieNames = (sessionCookies || []).map(c => c.name);
+const hasCfClearanceInput = cookieNames.includes('cf_clearance');
 log.info('Starting Sahibinden Emlak Scraper', {
     startUrls: startUrls.map(u => typeof u === 'string' ? u : u.url),
     maxItems,
@@ -61,6 +63,9 @@ log.info('Starting Sahibinden Emlak Scraper', {
     maxConcurrency,
     proxyGroups: finalProxyConfiguration.apifyProxyGroups,
     countryCode: finalProxyConfiguration.countryCode,
+    sessionCookiesProvided: cookieNames.length,
+    cookieNames,
+    hasCfClearance: hasCfClearanceInput,
 });
 
 if (proxyConfig) {
@@ -196,7 +201,9 @@ const crawler = new PuppeteerCrawler({
                             sameSite: c.sameSite === 'no_restriction' ? 'None' : (c.sameSite || 'Lax'),
                         }));
                         await page.setCookie(...formattedCookies);
-                        log.debug(`Injected ${formattedCookies.length} valid session cookies.`);
+                        log.info(`Injected ${formattedCookies.length} valid session cookies: ${formattedCookies.map(c => c.name).join(', ')}`);
+                    } else {
+                        log.warning('All provided sessionCookies were expired — none injected. Please export fresh cookies from your browser.');
                     }
                 } catch (e) {
                     log.warning(`Failed to inject session cookies: ${e.message}`);
@@ -205,11 +212,18 @@ const crawler = new PuppeteerCrawler({
 
             // Check if we have a valid cf_clearance (from either input cookies or session pool)
             const allCurrentCookies = await page.cookies('https://www.sahibinden.com').catch(() => []);
-            const hasValidCfClearance = allCurrentCookies.some(c => {
-                if (c.name !== 'cf_clearance') return false;
-                const expiry = c.expires ?? null;
-                return !expiry || expiry === -1 || expiry > nowSecs;
-            });
+            const cfClearanceCookie = allCurrentCookies.find(c => c.name === 'cf_clearance');
+            const hasValidCfClearance = cfClearanceCookie
+                ? (!cfClearanceCookie.expires || cfClearanceCookie.expires === -1 || cfClearanceCookie.expires > nowSecs)
+                : false;
+
+            if (cfClearanceCookie) {
+                const expiry = cfClearanceCookie.expires;
+                const expiresIn = expiry && expiry !== -1 ? Math.round((expiry - nowSecs) / 60) : null;
+                log.info(`cf_clearance cookie found. expires in: ${expiresIn !== null ? expiresIn + ' min' : 'session'}, valid: ${hasValidCfClearance}`);
+            } else {
+                log.info('No cf_clearance cookie present in page context.');
+            }
 
             // Pre-warm: navigate to homepage BEFORE target URL to earn cf_clearance.
             // Only runs once per session (tracked via session.userData.warmedUp).
