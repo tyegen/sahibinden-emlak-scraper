@@ -123,6 +123,7 @@ const crawler = new PlaywrightCrawler({
     },
 
     launchContext: {
+        useChrome: true, // tells Crawlee to use the Chrome binary pre-installed in the Apify image
         launchOptions: {
             headless: process.env.HEADLESS !== 'false',
             args: [
