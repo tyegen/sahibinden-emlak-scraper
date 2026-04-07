@@ -1,8 +1,6 @@
 // src/main.js - Sahibinden.com Emlak Scraper
 import { Actor } from 'apify';
-import { PuppeteerCrawler, log } from 'crawlee';
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { PlaywrightCrawler, log } from 'crawlee';
 import {
     randomUserAgent,
     randomDelay,
@@ -12,9 +10,6 @@ import {
     extractListingId,
 } from './utils.js';
 import { createBaseRowIntegration } from './baserow.js';
-
-// Apply the stealth plugin to puppeteer
-puppeteer.use(StealthPlugin());
 
 // Initialize the Apify Actor
 await Actor.init();
@@ -31,23 +26,19 @@ const {
         apifyProxyGroups: ['RESIDENTIAL'],
         countryCode: 'TR',
     },
-    // BaseRow fields (optional)
     baseRowApiToken,
     baseRowTableId,
     baseRowDatabaseId,
-    // Session Cookies for login bypass
     sessionCookies = [],
 } = input;
 
 // Force RESIDENTIAL proxy with TR country code
-// Even if user provides partial proxy config, ensure RESIDENTIAL is used
 const finalProxyConfiguration = {
     useApifyProxy: true,
     apifyProxyGroups: ['RESIDENTIAL'],
     countryCode: 'TR',
     ...(proxyConfiguration || {}),
 };
-// Always ensure RESIDENTIAL is in the groups
 if (!finalProxyConfiguration.apifyProxyGroups || finalProxyConfiguration.apifyProxyGroups.length === 0) {
     finalProxyConfiguration.apifyProxyGroups = ['RESIDENTIAL'];
 }
@@ -55,7 +46,6 @@ if (!finalProxyConfiguration.countryCode) {
     finalProxyConfiguration.countryCode = 'TR';
 }
 
-// Create the proxy configuration
 const proxyConfig = await Actor.createProxyConfiguration(finalProxyConfiguration);
 
 log.info('Starting Sahibinden Emlak Scraper', {
@@ -87,15 +77,34 @@ try {
 
 let scrapedItemsCount = 0;
 
-// Store for detail page data (keyed by URL)
-const detailDataStore = {};
+// Normalize sameSite values from browser export formats to Playwright-accepted values
+function normalizeSameSite(value) {
+    if (!value) return 'Lax';
+    const lower = value.toLowerCase();
+    if (lower === 'strict') return 'Strict';
+    if (lower === 'none' || lower === 'no_restriction') return 'None';
+    return 'Lax';
+}
 
-// Create the Puppeteer crawler
-const crawler = new PuppeteerCrawler({
+// Check if page content indicates a bot challenge
+function isChallengedPage(html) {
+    return (
+        html.includes('Just a moment') ||
+        html.includes('Checking your browser') ||
+        html.includes('cf-browser-verification') ||
+        html.includes('challenge-platform') ||
+        html.includes('Güvenlik doğrulaması gerçekleştirme') ||
+        html.includes('Bir dakika lütfen') ||
+        html.includes('Uyumsuz tarayıcı eklentisi')
+    );
+}
+
+// Create the Playwright crawler
+const crawler = new PlaywrightCrawler({
     proxyConfiguration: proxyConfig,
     maxConcurrency,
     maxRequestsPerCrawl: maxItems ? maxItems * 3 : 1000,
-    maxRequestRetries: 8,
+    maxRequestRetries: 5,
     navigationTimeoutSecs: 90,
     requestHandlerTimeoutSecs: 180,
 
@@ -111,12 +120,22 @@ const crawler = new PuppeteerCrawler({
 
     browserPoolOptions: {
         retireBrowserAfterPageCount: 20,
+        // Inject realistic browser fingerprints (canvas, WebGL, audio, screen)
+        // generated from real user data — much stronger than the old stealth plugin
+        fingerprintOptions: {
+            fingerprintGeneratorOptions: {
+                browsers: [{ name: 'chrome', minVersion: 120, maxVersion: 125 }],
+                devices: ['desktop'],
+                operatingSystems: ['windows'],
+                locales: ['tr-TR'],
+            },
+        },
     },
 
     launchContext: {
-        launcher: puppeteer,
         launchOptions: {
-            headless: process.env.HEADLESS !== 'false', // allow debugging with HEADLESS=false
+            headless: process.env.HEADLESS !== 'false',
+            channel: 'chrome', // use real installed Chrome for better fingerprint
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -125,21 +144,18 @@ const crawler = new PuppeteerCrawler({
                 '--disable-infobars',
                 '--window-size=1920,1080',
                 '--start-maximized',
-                // Additional stealth flags
                 '--disable-features=IsolateOrigins,site-per-process',
                 '--disable-site-isolation-trials',
             ],
             ignoreDefaultArgs: ['--enable-automation'],
         },
-        useChrome: true, // often better for stealth than chromium
     },
 
     preNavigationHooks: [
         async ({ page, request }, gotoOptions) => {
-            // Apply session cookies if provided
+            // Inject session cookies before navigation so they are sent with the first request
             if (sessionCookies && Array.isArray(sessionCookies) && sessionCookies.length > 0) {
                 try {
-                    // Puppeteer expects cookies without generic attributes sometimes, formatting them
                     const formattedCookies = sessionCookies.map(c => ({
                         name: c.name,
                         value: c.value,
@@ -147,17 +163,15 @@ const crawler = new PuppeteerCrawler({
                         path: c.path || '/',
                         secure: c.secure !== false,
                         httpOnly: c.httpOnly === true,
-                        sameSite: c.sameSite || 'Lax'
+                        sameSite: normalizeSameSite(c.sameSite),
                     }));
-                    await page.setCookie(...formattedCookies);
+                    await page.context().addCookies(formattedCookies);
                     log.debug(`Injected ${formattedCookies.length} session cookies.`);
                 } catch (e) {
                     log.warning(`Failed to inject session cookies: ${e.message}`);
                 }
             }
 
-            const ua = randomUserAgent();
-            await page.setUserAgent(ua);
             await page.setExtraHTTPHeaders({
                 'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -171,134 +185,64 @@ const crawler = new PuppeteerCrawler({
                 'sec-ch-ua-platform': '"Windows"',
             });
 
-            // Keep the viewport consistent with the window size to avoid detection
-            const width = 1920;
-            const height = 1080;
-            await page.setViewport({ width, height });
+            await page.setViewportSize({ width: 1920, height: 1080 });
 
-            // Advanced stealth overrides
-            await page.evaluateOnNewDocument(() => {
-                // Pass webdriver check
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined,
-                });
+            // Stealth init script — runs in page context before any page JS
+            await page.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-                // Pass chrome check
                 window.chrome = {
                     runtime: {},
                     loadTimes: function () { },
                     csi: function () { },
-                    app: {}
+                    app: {},
                 };
 
-                // Pass permissions check
                 const originalQuery = window.navigator.permissions.query;
                 window.navigator.permissions.query = parameters => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : originalQuery(parameters)
                 );
 
-                // Mock plugins
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => {
-                        const plugins = [
-                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                            { name: 'Chrome PDF Viewer', filename: 'mhjimihiapuabedfglidnhagcfenogec', description: '' },
-                            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-                        ];
-
-                        // Add mock methods expected from the PluginArray
-                        plugins.item = (i) => plugins[i];
-                        plugins.namedItem = (name) => plugins.find(p => p.name === name);
-                        plugins.refresh = () => { };
-
-                        // Fake the iterator
-                        plugins[Symbol.iterator] = function* () {
-                            yield* Object.values(plugins);
-                        };
-
-                        // Inherit from PluginArray
-                        Object.setPrototypeOf(plugins, PluginArray.prototype);
-
-                        return plugins;
-                    }
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['tr-TR', 'tr', 'en-US', 'en'],
                 });
-
-                // Mock languages
-                Object.defineProperty(navigator, 'languages', { get: () => ['tr-TR', 'tr', 'en-US', 'en'] });
-
-                // Add dummy WebGL functions to thwart fingerprinting
-                const getParameter = WebGLRenderingContext.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function (parameter) {
-                    // UNMASKED_VENDOR_WEBGL
-                    if (parameter === 37445) {
-                        return 'Intel Inc.';
-                    }
-                    // UNMASKED_RENDERER_WEBGL
-                    if (parameter === 37446) {
-                        return 'Intel Iris OpenGL Engine';
-                    }
-                    return getParameter(parameter);
-                };
             });
 
             if (gotoOptions) {
-                gotoOptions.waitUntil = 'networkidle2';
+                gotoOptions.waitUntil = 'networkidle';
                 gotoOptions.timeout = 90000;
             }
         },
     ],
 
     postNavigationHooks: [
-        async ({ page, response, request, session, log }) => {
+        async ({ page, response, request, session }) => {
             const statusCode = response?.status();
             log.info(`Response status: ${statusCode} for ${request.url}`);
 
-            // If we got 403, wait for Cloudflare challenge to resolve
+            // Handle Cloudflare challenge (403/503/429)
             if (statusCode === 403 || statusCode === 503 || statusCode === 429) {
                 log.warning(`Got ${statusCode}, waiting for Cloudflare challenge to resolve...`);
 
-                // Wait for Cloudflare JS to execute and redirect
                 await randomDelay(5000, 10000);
 
-                // Simulate human movement
+                // Simulate human mouse movement
                 try {
                     await page.mouse.move(100 + Math.random() * 500, 100 + Math.random() * 500);
                     await page.mouse.move(200 + Math.random() * 500, 200 + Math.random() * 500);
                 } catch (e) { }
 
-                // Check if we're on a Cloudflare challenge page
                 const content = await page.content();
-                if (
-                    content.includes('Just a moment') ||
-                    content.includes('Checking your browser') ||
-                    content.includes('cf-browser-verification') ||
-                    content.includes('challenge-platform') ||
-                    content.includes('Güvenlik doğrulaması gerçekleştirme') ||
-                    content.includes('Uyumsuz tarayıcı eklentisi')
-                ) {
+                if (isChallengedPage(content)) {
                     log.info('Cloudflare challenge page detected, waiting for resolution...');
-
-                    // Wait for navigation (Cloudflare auto-redirects after solving)
                     try {
-                        await page.waitForNavigation({
-                            waitUntil: 'networkidle2',
-                            timeout: 45000, // increased timeout for solving
-                        });
+                        await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 45000 });
 
-                        // Re-check: navigation completed but may have landed on another challenge page
+                        // Re-check: navigation may have landed on another challenge page
                         const resolvedContent = await page.content();
-                        const stillChallenged =
-                            resolvedContent.includes('Just a moment') ||
-                            resolvedContent.includes('Checking your browser') ||
-                            resolvedContent.includes('cf-browser-verification') ||
-                            resolvedContent.includes('challenge-platform') ||
-                            resolvedContent.includes('Güvenlik doğrulaması gerçekleştirme') ||
-                            resolvedContent.includes('Bir dakika lütfen') ||
-                            resolvedContent.includes('Uyumsuz tarayıcı eklentisi');
-
-                        if (stillChallenged) {
+                        if (isChallengedPage(resolvedContent)) {
                             log.warning('Cloudflare challenge navigated to another challenge page. Marking session bad.');
                             if (session) session.markBad();
                             throw new Error('Cloudflare Turnstile challenge requires manual verification');
@@ -312,7 +256,6 @@ const crawler = new PuppeteerCrawler({
                         throw new Error('Cloudflare challenge timeout');
                     }
                 } else {
-                    // True 403 block, mark session as bad and retry
                     log.warning('Received 403 without recognized Cloudflare challenge. Marking session as bad.');
                     if (session) session.markBad();
                     throw new Error(`Blocked with status ${statusCode}`);
@@ -320,11 +263,10 @@ const crawler = new PuppeteerCrawler({
             }
 
             // Detect tloading page (200 response but JS redirect page)
-            const currentUrl = page.url();
-            if (currentUrl.includes('/cs/tloading')) {
+            if (page.url().includes('/cs/tloading')) {
                 log.info('Detected tloading protection page, waiting for JS redirect...');
                 try {
-                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+                    await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 });
                     log.info(`tloading resolved, now at: ${page.url()}`);
                 } catch (e) {
                     log.warning('tloading page did not redirect in time. Marking session bad and retrying.');
@@ -333,13 +275,10 @@ const crawler = new PuppeteerCrawler({
                 }
             }
 
-            // Validate we're on the right page
+            // Validate we're not on the login page
             if (page.url().includes('/giris') || page.url().includes('secure.sahibinden.com')) {
                 log.error('Redirected to login page. Your session cookies are missing or expired.');
                 if (session) session.markBad();
-
-                // We must abort the whole crawl if login is required but cookies are invalid,
-                // otherwise it'll just burn through proxies and retries uselessly.
                 throw new Error('Mandatory login required. Please update the sessionCookies input.');
             }
 
@@ -353,30 +292,20 @@ const crawler = new PuppeteerCrawler({
         const label = request.userData?.label || 'CATEGORY';
         log.info(`Processing page [${label}]: ${request.url}`);
 
-        // Random delay to simulate human behavior
         await randomDelay(2000, 5000);
 
         try {
-            // Additional Cloudflare check on page content
-            const isChallengedPage = (html) =>
-                html.includes('Checking your browser') ||
-                html.includes('cf-browser-verification') ||
-                html.includes('Just a moment') ||
-                html.includes('Güvenlik doğrulaması gerçekleştirme') ||
-                html.includes('Bir dakika lütfen') ||
-                html.includes('challenge-platform');
-
+            // Extra challenge check inside the handler
             const pageContent = await page.content();
             if (isChallengedPage(pageContent)) {
-                log.warning('Cloudflare challenge still present in page, waiting...');
+                log.warning('Bot challenge still present in page, waiting...');
                 await randomDelay(8000, 15000);
-                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => { });
+                await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => { });
 
-                // Recheck
                 const newContent = await page.content();
                 if (isChallengedPage(newContent)) {
                     if (session) session.markBad();
-                    throw new Error('Cloudflare challenge not resolved');
+                    throw new Error('Bot challenge not resolved');
                 }
             }
 
@@ -405,8 +334,7 @@ const crawler = new PuppeteerCrawler({
 });
 
 // CRITICAL: Override Crawlee's internal blocked request check
-// Crawlee hardcodes 403 as "blocked" and throws BEFORE requestHandler runs,
-// even when our postNavigationHook successfully resolves the Cloudflare challenge.
+// Crawlee hardcodes 403 as "blocked" and throws BEFORE requestHandler runs.
 // We handle 403/503 ourselves in postNavigationHooks.
 const originalThrowOnBlocked = crawler._throwOnBlockedRequest?.bind(crawler);
 if (originalThrowOnBlocked) {
@@ -434,7 +362,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
     const nextPageSelector = 'a.prevNextBut[title="Sonraki"]:not(.passive)';
 
     try {
-        // Try the main selector first
         let listingElements = [];
         try {
             await page.waitForSelector(listingRowSelector, { timeout: 15000 });
@@ -442,7 +369,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
         } catch (e) {
             log.warning(`Primary selector failed: ${listingRowSelector}`);
 
-            // DEBUG: Capture page state for analysis
             const pageTitle = await page.title().catch(() => 'unknown');
             const currentUrl = page.url();
             const bodyHTML = await page.$eval('body', el => el.innerHTML.substring(0, 3000)).catch(() => 'Could not get HTML');
@@ -450,7 +376,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             log.info('DEBUG Page state:', { title: pageTitle, url: currentUrl });
             log.info('DEBUG HTML preview (first 2000 chars):', { html: bodyHTML.substring(0, 2000) });
 
-            // Save screenshot to key-value store for debugging
             try {
                 const screenshot = await page.screenshot({ fullPage: true, type: 'png' });
                 await Actor.setValue('DEBUG-screenshot', screenshot, { contentType: 'image/png' });
@@ -459,7 +384,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                 log.warning('Could not save debug screenshot');
             }
 
-            // Try alternative selectors
             const alternativeSelectors = [
                 'table.searchResultsTable tr.searchResultsItem',
                 '.searchResultsRowClass .searchResultsItem',
@@ -480,13 +404,11 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             }
 
             if (listingElements.length === 0) {
-                // Log all table elements on the page
                 const tableCount = await page.$$eval('table', tables => tables.length).catch(() => 0);
                 const trCount = await page.$$eval('tr', rows => rows.length).catch(() => 0);
                 const tbodyCount = await page.$$eval('tbody', bodies => bodies.length).catch(() => 0);
                 log.info('DEBUG: Page structure', { tables: tableCount, rows: trCount, tbodies: tbodyCount });
 
-                // Log all class names containing "search" or "result"
                 const searchClasses = await page.evaluate(() => {
                     const allElements = document.querySelectorAll('*');
                     const classes = new Set();
@@ -512,11 +434,9 @@ async function handleCategoryPage(page, request, enqueueLinks) {
         const results = [];
 
         for (const element of listingElements) {
-            // Check maxItems limit
             if (maxItems !== null && scrapedItemsCount >= maxItems) {
                 log.info(`Maximum items limit (${maxItems}) reached. Stopping scrape.`);
 
-                // Push any currently collected results before aborting
                 if (results.length > 0) {
                     await Actor.pushData(results);
                     if (baseRowIntegration) {
@@ -533,7 +453,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             }
 
             try {
-                // Extract title and URL
                 const titleElement = await element.$(titleLinkSelector);
                 const title = await titleElement?.evaluate(el => el.textContent?.trim()).catch(() => null);
                 const detailUrl = await titleElement?.evaluate(el => el.href).catch(() => null);
@@ -543,29 +462,18 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                     continue;
                 }
 
-                // Extract price
                 const priceText = await element.$eval(priceSelector, el => el.textContent?.trim()).catch(() => null);
 
-                // Extract location
                 const location = await element.$eval(locationSelector, el => {
                     return el.innerText?.trim().replace(/\n/g, ' / ');
                 }).catch(() => null);
 
-                // Extract date
                 const date = await element.$eval(dateSelector, el => {
                     return el.innerText?.trim().replace(/\n/g, ' ');
                 }).catch(() => null);
 
-                // Extract thumbnail image
                 const image = await element.$eval('img', el => el.src || el.dataset?.src || null).catch(() => null);
 
-                // Try to extract column-specific data (m², rooms etc.) from the table cells
-                // Sahibinden emlak listing columns vary by category, so we extract all td cells
-                const cellTexts = await element.$$eval('td', cells =>
-                    cells.map(cell => cell.textContent?.trim() || '')
-                ).catch(() => []);
-
-                // Extract listing ID from URL
                 const id = extractListingId(detailUrl);
 
                 const listingData = {
@@ -582,7 +490,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                     sourceUrl: request.url,
                 };
 
-                // If includeDetails is enabled, enqueue the detail page
                 if (includeDetails && detailUrl) {
                     await enqueueLinks({
                         urls: [detailUrl],
@@ -591,7 +498,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                             listingData: listingData,
                         },
                     });
-                    // Don't push to dataset yet — will push from detail handler
                 } else {
                     results.push(listingData);
                     scrapedItemsCount++;
@@ -603,12 +509,10 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             }
         }
 
-        // Push results from this page (only if not including details)
         if (results.length > 0) {
             await Actor.pushData(results);
             log.info(`Pushed ${results.length} listings from page. Total scraped: ${scrapedItemsCount}`);
 
-            // Store in BaseRow if configured
             if (baseRowIntegration) {
                 try {
                     await baseRowIntegration.storeListings(results);
@@ -620,7 +524,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             log.info(`No listings extracted from page ${request.url}.`);
         }
 
-        // Enqueue next page
         if (maxItems !== null && scrapedItemsCount >= maxItems) {
             log.info(`Maximum items limit (${maxItems}) reached. Not enqueueing next page.`);
             await crawler.autoscaledPool?.abort();
@@ -635,8 +538,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                 urls: [absoluteNextPageUrl],
                 userData: { label: 'CATEGORY' },
             });
-
-            // Small delay before next page
             await randomDelay(1000, 3000);
         } else {
             log.info(`No next page button found on ${request.url}`);
@@ -654,20 +555,16 @@ async function handleCategoryPage(page, request, enqueueLinks) {
 async function handleDetailPage(page, request) {
     log.info(`Handling detail page: ${request.url}`);
 
-    // Get the base listing data passed from the category page
     const listingData = request.userData?.listingData || {};
 
     try {
-        // Wait for the page to load
         await page.waitForSelector('body', { timeout: 30000 });
         await randomDelay(1000, 3000);
 
-        // Extract description
         const description = await page.$eval('#classifiedDescription', el => {
             return el.textContent?.trim() || '';
         }).catch(() => '');
 
-        // Extract all info fields from the classified info list
         const info = {};
         try {
             const infoItems = await page.$$('.classifiedInfoList li');
@@ -682,28 +579,23 @@ async function handleDetailPage(page, request) {
             log.debug('Could not extract info list', { error: e.message });
         }
 
-        // Extract images
         const images = await page.$$eval(
             '.classifiedDetailMainPhoto img, .swiper-slide img, #classifiedDetailPhotos img',
             imgs => imgs.map(img => img.src || img.dataset?.src).filter(Boolean)
         ).catch(() => []);
 
-        // Deduplicate images
         const uniqueImages = [...new Set(images)];
 
-        // Extract seller info
         const seller = await page.$eval(
             '.classifiedUserContent h5, .classifiedOtherBoxes .username-info-area',
             el => el.textContent?.trim()
         ).catch(() => null);
 
-        // Extract listing ID from the page if not already present
         const pageId = await page.$eval(
             '.classifiedId',
             el => el.textContent?.replace(/[^0-9]/g, '')
         ).catch(() => null);
 
-        // Build the complete listing data
         const completeData = {
             ...listingData,
             id: listingData.id || pageId || extractListingId(request.url),
@@ -711,7 +603,6 @@ async function handleDetailPage(page, request) {
             images: uniqueImages,
             seller: seller ? normalizeText(seller) : null,
             info: info,
-            // Extract commonly needed fields from info for convenience
             size: info['Brüt / Net M2'] || info['m² (Brüt)'] || info['m² (Net)'] || null,
             rooms: info['Oda Sayısı'] || null,
             buildingAge: info['Bina Yaşı'] || null,
@@ -726,12 +617,10 @@ async function handleDetailPage(page, request) {
             creditEligible: info['Krediye Uygun'] || null,
         };
 
-        // Push to dataset
         await Actor.pushData(completeData);
         scrapedItemsCount++;
         log.info(`Pushed detail data for listing ${completeData.id}. Total scraped: ${scrapedItemsCount}`);
 
-        // Store in BaseRow if configured
         if (baseRowIntegration) {
             try {
                 await baseRowIntegration.storeListing(completeData);
@@ -740,7 +629,6 @@ async function handleDetailPage(page, request) {
             }
         }
 
-        // Check maxItems
         if (maxItems !== null && scrapedItemsCount >= maxItems) {
             log.info(`Maximum items limit (${maxItems}) reached.`);
             await crawler.autoscaledPool?.abort();
@@ -750,7 +638,6 @@ async function handleDetailPage(page, request) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         log.warning(`Could not handle detail page ${request.url}: ${errorMessage}`);
 
-        // Still try to push the basic listing data
         if (listingData.title) {
             await Actor.pushData(listingData);
             scrapedItemsCount++;

@@ -1,8 +1,10 @@
 # Specify the base Docker image.
-FROM apify/actor-node-puppeteer-chrome:20 AS intermediate
+# Playwright + Chrome image replaces the old Puppeteer image.
+# Includes real Chrome, Playwright, and Crawlee's fingerprint-suite pre-installed.
+FROM apify/actor-node-playwright-chrome:20 AS intermediate
 
 # Check preinstalled packages
-RUN npm ls crawlee apify puppeteer playwright
+RUN npm ls crawlee apify playwright
 
 # Copy just package.json and package-lock.json
 COPY --chown=myuser package*.json ./
@@ -14,10 +16,10 @@ RUN npm install --include=dev --audit=false
 COPY --chown=myuser . ./
 
 # Create final image
-FROM apify/actor-node-puppeteer-chrome:20
+FROM apify/actor-node-playwright-chrome:20
 
 # Check preinstalled packages
-RUN npm ls crawlee apify puppeteer playwright
+RUN npm ls crawlee apify playwright
 
 # Copy just package.json and package-lock.json
 COPY --chown=myuser package*.json ./
