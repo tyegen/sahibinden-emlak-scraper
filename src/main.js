@@ -300,9 +300,22 @@ const crawler = new PuppeteerCrawler({
                 }
             }
 
-            // Validate we're on the right page
+            // Detect tloading page (200 response but JS redirect page)
             const currentUrl = page.url();
-            if (currentUrl.includes('/giris') || currentUrl.includes('secure.sahibinden.com')) {
+            if (currentUrl.includes('/cs/tloading')) {
+                log.info('Detected tloading protection page, waiting for JS redirect...');
+                try {
+                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+                    log.info(`tloading resolved, now at: ${page.url()}`);
+                } catch (e) {
+                    log.warning('tloading page did not redirect in time. Marking session bad and retrying.');
+                    if (session) session.markBad();
+                    throw new Error('tloading page did not resolve');
+                }
+            }
+
+            // Validate we're on the right page
+            if (page.url().includes('/giris') || page.url().includes('secure.sahibinden.com')) {
                 log.error('Redirected to login page. Your session cookies are missing or expired.');
                 if (session) session.markBad();
 
@@ -741,7 +754,8 @@ const startRequests = (Array.isArray(startUrls) ? startUrls : [startUrls]).map(i
         return null;
     }
 
-    return { url: urlString, userData: { label: 'CATEGORY' } };
+    const isDetailUrl = urlString.includes('/ilan/') && urlString.includes('/detay');
+    return { url: urlString, userData: { label: isDetailUrl ? 'DETAIL' : 'CATEGORY' } };
 }).filter(req => req !== null);
 
 if (startRequests.length > 0) {
