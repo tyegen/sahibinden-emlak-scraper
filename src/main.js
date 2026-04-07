@@ -138,20 +138,39 @@ const crawler = new PlaywrightCrawler({
 
     preNavigationHooks: [
         async ({ page, request }, gotoOptions) => {
-            // Inject session cookies before navigation so they are sent with the first request
+            // Inject session cookies before navigation so they are sent with the first request.
+            // Filter out expired cookies — sending an expired cf_clearance to Cloudflare
+            // is treated as a bad/suspicious request and makes detection worse.
             if (sessionCookies && Array.isArray(sessionCookies) && sessionCookies.length > 0) {
                 try {
-                    const formattedCookies = sessionCookies.map(c => ({
-                        name: c.name,
-                        value: c.value,
-                        domain: c.domain || '.sahibinden.com',
-                        path: c.path || '/',
-                        secure: c.secure !== false,
-                        httpOnly: c.httpOnly === true,
-                        sameSite: normalizeSameSite(c.sameSite),
-                    }));
-                    await page.context().addCookies(formattedCookies);
-                    log.debug(`Injected ${formattedCookies.length} session cookies.`);
+                    const nowSecs = Date.now() / 1000;
+                    const validCookies = sessionCookies.filter(c => {
+                        const expiry = c.expirationDate ?? c.expires ?? null;
+                        if (expiry && expiry < nowSecs) {
+                            log.debug(`Skipping expired cookie: ${c.name} (expired ${new Date(expiry * 1000).toISOString()})`);
+                            return false;
+                        }
+                        return true;
+                    });
+
+                    if (validCookies.length < sessionCookies.length) {
+                        log.warning(`Filtered out ${sessionCookies.length - validCookies.length} expired cookies. ` +
+                            `If cf_clearance expired, the scraper will try to earn a fresh one via session pre-warm.`);
+                    }
+
+                    if (validCookies.length > 0) {
+                        const formattedCookies = validCookies.map(c => ({
+                            name: c.name,
+                            value: c.value,
+                            domain: c.domain || '.sahibinden.com',
+                            path: c.path || '/',
+                            secure: c.secure !== false,
+                            httpOnly: c.httpOnly === true,
+                            sameSite: normalizeSameSite(c.sameSite),
+                        }));
+                        await page.context().addCookies(formattedCookies);
+                        log.debug(`Injected ${formattedCookies.length} valid session cookies.`);
+                    }
                 } catch (e) {
                     log.warning(`Failed to inject session cookies: ${e.message}`);
                 }
@@ -291,11 +310,17 @@ const crawler = new PlaywrightCrawler({
         const label = request.userData?.label || 'CATEGORY';
         log.info(`Processing page [${label}]: ${request.url}`);
 
-        // Pre-warm new sessions via the homepage to earn a cf_clearance cookie
-        // on the proxy's own IP before hitting category/detail pages.
-        // cf_clearance is IP-bound, so we can't reuse the user's browser cookie —
-        // we need to earn one fresh on each proxy session.
-        if (!session?.userData?.warmedUp) {
+        // Pre-warm: navigate to the homepage to earn a fresh cf_clearance for this
+        // proxy session. Only needed when the user's cf_clearance cookie is missing
+        // or expired — if they provided a valid one, skip the warmup entirely.
+        const nowSecs = Date.now() / 1000;
+        const hasValidCfClearance = sessionCookies.some(c => {
+            if (c.name !== 'cf_clearance') return false;
+            const expiry = c.expirationDate ?? c.expires ?? null;
+            return !expiry || expiry > nowSecs;
+        });
+
+        if (!hasValidCfClearance && !session?.userData?.warmedUp) {
             log.info('New session — warming up via homepage...');
             try {
                 await page.goto('https://www.sahibinden.com', {
