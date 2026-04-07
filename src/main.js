@@ -122,6 +122,18 @@ const crawler = new PlaywrightCrawler({
         retireBrowserAfterPageCount: 20,
     },
 
+    launchContext: {
+        launchOptions: {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+            ],
+        },
+    },
+
 
     preNavigationHooks: [
         async ({ page, request }, gotoOptions) => {
