@@ -56,6 +56,7 @@ const proxyConfig = await Actor.createProxyConfiguration(finalProxyConfiguration
 
 const cookieNames = (sessionCookies || []).map(c => c.name);
 const hasCfClearanceInput = cookieNames.includes('cf_clearance');
+const hasPxCookies = ['_px3', '_pxhd', '_pxvid', 'pxcts'].some(n => cookieNames.includes(n));
 log.info('Starting Sahibinden Emlak Scraper', {
     startUrls: startUrls.map(u => typeof u === 'string' ? u : u.url),
     maxItems,
@@ -66,7 +67,13 @@ log.info('Starting Sahibinden Emlak Scraper', {
     sessionCookiesProvided: cookieNames.length,
     cookieNames,
     hasCfClearance: hasCfClearanceInput,
+    hasPerimeterXCookies: hasPxCookies,
 });
+if (!hasPxCookies) {
+    log.warning('No PerimeterX cookies provided (_px3, _pxhd, _pxvid, pxcts). ' +
+        'If sahibinden shows a "Basılı Tutun" challenge, the actor will try to hold it automatically. ' +
+        'For reliable bypass: visit sahibinden.com in your browser, solve the hold challenge, then export ALL cookies.');
+}
 
 if (proxyConfig) {
     log.info('Using proxy configuration', {
@@ -88,7 +95,7 @@ try {
 
 let scrapedItemsCount = 0;
 
-// Check if page content is a bot challenge page
+// Check if page content is a Cloudflare challenge page
 function isChallengedPage(html) {
     return (
         html.includes('Just a moment') ||
@@ -99,6 +106,82 @@ function isChallengedPage(html) {
         html.includes('Bir dakika lütfen') ||
         html.includes('Uyumsuz tarayıcı eklentisi')
     );
+}
+
+// Check if page content is a PerimeterX "press and hold" challenge
+function isPxHoldChallenge(html) {
+    return (
+        html.includes('Basılı Tutun') ||
+        html.includes('px-captcha') ||
+        html.includes('_pxCaptcha') ||
+        html.includes('PerimeterX') ||
+        html.includes('Bağlantınız kontrol ediliyor') ||
+        html.includes('human-challenge')
+    );
+}
+
+// Attempt to solve the PerimeterX press-and-hold challenge programmatically
+async function tryHoldPxButton(page) {
+    try {
+        // Try known PX hold button selectors
+        const selectors = [
+            '#px-captcha',
+            '.px-captcha-container',
+            'div[id^="px-captcha"]',
+            'button',
+        ];
+
+        let holdTarget = null;
+        for (const sel of selectors) {
+            holdTarget = await page.$(sel).catch(() => null);
+            if (holdTarget) {
+                log.info(`Found PX hold target with selector: ${sel}`);
+                break;
+            }
+        }
+
+        if (!holdTarget) {
+            log.warning('Could not find PX hold button element.');
+            return false;
+        }
+
+        const box = await holdTarget.boundingBox();
+        if (!box) {
+            log.warning('PX hold button has no bounding box (not visible?)');
+            return false;
+        }
+
+        const cx = box.x + box.width / 2;
+        const cy = box.y + box.height / 2;
+
+        log.info(`Attempting PX hold at (${Math.round(cx)}, ${Math.round(cy)}) for 10s...`);
+
+        // Move to button naturally
+        await page.mouse.move(cx - 50, cy - 30);
+        await new Promise(r => setTimeout(r, 300));
+        await page.mouse.move(cx, cy, { steps: 10 });
+        await new Promise(r => setTimeout(r, 200));
+
+        // Hold down
+        await page.mouse.down();
+        await new Promise(r => setTimeout(r, 10000));
+        await page.mouse.up();
+
+        log.info('Released PX hold button, waiting for redirect...');
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+
+        const afterHtml = await page.content();
+        if (isPxHoldChallenge(afterHtml) || isChallengedPage(afterHtml)) {
+            log.warning('PX hold did not resolve the challenge.');
+            return false;
+        }
+
+        log.info('PX hold challenge resolved successfully!');
+        return true;
+    } catch (e) {
+        log.warning(`PX hold attempt error: ${e.message}`);
+        return false;
+    }
 }
 
 let debugCounter = 0;
@@ -362,7 +445,19 @@ const crawler = new PuppeteerCrawler({
                 } catch (e) { }
 
                 const content = await page.content();
-                if (isChallengedPage(content)) {
+
+                if (isPxHoldChallenge(content)) {
+                    // PerimeterX "press and hold" challenge
+                    log.info('PerimeterX hold challenge detected — attempting automated hold...');
+                    await saveDebugInfo(page, `${statusCode}-px-hold`);
+                    const pxSolved = await tryHoldPxButton(page);
+                    if (!pxSolved) {
+                        log.warning('PerimeterX hold challenge failed. Provide _px3/_pxhd/_pxvid/pxcts cookies from your browser to bypass this.');
+                        await saveDebugInfo(page, `${statusCode}-px-hold-failed`);
+                        if (session) session.markBad();
+                        throw new Error('PerimeterX hold challenge not resolved');
+                    }
+                } else if (isChallengedPage(content)) {
                     log.info('Cloudflare challenge page detected, waiting for auto-resolution...');
                     await saveDebugInfo(page, `${statusCode}-challenge`);
                     try {
@@ -370,23 +465,31 @@ const crawler = new PuppeteerCrawler({
 
                         // Re-check: navigation may have landed on another challenge page
                         const resolvedContent = await page.content();
-                        if (isChallengedPage(resolvedContent)) {
+                        if (isPxHoldChallenge(resolvedContent)) {
+                            log.info('CF resolved but now hit PX hold challenge — attempting hold...');
+                            await saveDebugInfo(page, `${statusCode}-cf-then-px`);
+                            const pxSolved = await tryHoldPxButton(page);
+                            if (!pxSolved) {
+                                if (session) session.markBad();
+                                throw new Error('PerimeterX hold challenge not resolved after CF');
+                            }
+                        } else if (isChallengedPage(resolvedContent)) {
                             log.warning('Cloudflare challenge navigated to another challenge page. Marking session bad.');
                             await saveDebugInfo(page, `${statusCode}-challenge-still-blocked`);
                             if (session) session.markBad();
                             throw new Error('Cloudflare Turnstile challenge requires manual verification');
+                        } else {
+                            log.info('Cloudflare challenge resolved!');
                         }
-
-                        log.info('Cloudflare challenge resolved!');
                     } catch (e) {
-                        if (e.message.includes('Turnstile')) throw e;
+                        if (e.message.includes('Turnstile') || e.message.includes('PerimeterX')) throw e;
                         log.warning('Cloudflare challenge did not resolve in time. Retrying...');
                         await saveDebugInfo(page, `${statusCode}-challenge-timeout`);
                         if (session) session.markBad();
                         throw new Error('Cloudflare challenge timeout');
                     }
                 } else {
-                    log.warning('Received 403 without recognized Cloudflare challenge page. Marking session as bad.');
+                    log.warning('Received 403 without recognized challenge page. Marking session as bad.');
                     await saveDebugInfo(page, `${statusCode}-unknown-block`);
                     if (session) session.markBad();
                     throw new Error(`Blocked with status ${statusCode}`);
