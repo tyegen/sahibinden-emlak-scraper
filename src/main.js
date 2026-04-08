@@ -686,11 +686,16 @@ async function handleCategoryPage(page, request, enqueueLinks) {
         log.info(`Found ${listingElements.length} listings on page.`);
 
         const results = [];
+        // When includeDetails=true, collect detail URLs here and process them inline
+        // (same browser tab) rather than via Crawlee's queue.
+        // Reason: CF already trusts the browser context that loaded the category page.
+        // Navigating to detail URLs via the queue creates a fresh context per request,
+        // which CF challenges every time. Inline page.goto() reuses the trusted context.
+        const inlineDetailQueue = [];
 
         for (const element of listingElements) {
             if (maxItems !== null && scrapedItemsCount >= maxItems) {
                 log.info(`Maximum items limit (${maxItems}) reached. Stopping scrape.`);
-
                 if (results.length > 0) {
                     await Actor.pushData(results);
                     if (baseRowIntegration) {
@@ -699,7 +704,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                         }
                     }
                 }
-
                 await crawler.autoscaledPool?.abort();
                 return;
             }
@@ -735,10 +739,7 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                 };
 
                 if (includeDetails && detailUrl) {
-                    await enqueueLinks({
-                        urls: [detailUrl],
-                        userData: { label: 'DETAIL', listingData },
-                    });
+                    inlineDetailQueue.push({ url: detailUrl, listingData });
                 } else {
                     results.push(listingData);
                     scrapedItemsCount++;
@@ -753,7 +754,6 @@ async function handleCategoryPage(page, request, enqueueLinks) {
         if (results.length > 0) {
             await Actor.pushData(results);
             log.info(`Pushed ${results.length} listings from page. Total scraped: ${scrapedItemsCount}`);
-
             if (baseRowIntegration) {
                 try { await baseRowIntegration.storeListings(results); } catch (error) {
                     log.warning('Failed to store data in BaseRow', { error: error.message });
@@ -763,20 +763,101 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             log.info(`No listings extracted from page ${request.url}.`);
         }
 
-        if (maxItems !== null && scrapedItemsCount >= maxItems) {
-            log.info(`Maximum items limit (${maxItems}) reached. Not enqueueing next page.`);
-            await crawler.autoscaledPool?.abort();
-            return;
+        // Enqueue next category page BEFORE processing detail pages inline,
+        // so subsequent pages are queued and will run after we finish this batch.
+        if (maxItems === null || scrapedItemsCount < maxItems) {
+            const nextPageUrl = await page.$eval(nextPageSelector, anchor => anchor.href).catch(() => null);
+            if (nextPageUrl) {
+                log.info(`Enqueueing next category page: ${nextPageUrl}`);
+                const absoluteNextPageUrl = new URL(nextPageUrl, request.loadedUrl || request.url).toString();
+                await enqueueLinks({ urls: [absoluteNextPageUrl], userData: { label: 'CATEGORY' } });
+            } else {
+                log.info(`No next page button found on ${request.url}`);
+            }
         }
 
-        const nextPageUrl = await page.$eval(nextPageSelector, anchor => anchor.href).catch(() => null);
-        if (nextPageUrl) {
-            log.info(`Enqueueing next category page: ${nextPageUrl}`);
-            const absoluteNextPageUrl = new URL(nextPageUrl, request.loadedUrl || request.url).toString();
-            await enqueueLinks({ urls: [absoluteNextPageUrl], userData: { label: 'CATEGORY' } });
-            await randomDelay(1000, 3000);
-        } else {
-            log.info(`No next page button found on ${request.url}`);
+        // Process detail pages inline using the same browser tab.
+        // This keeps CF's trusted browser context alive across all detail navigations.
+        if (inlineDetailQueue.length > 0) {
+            log.info(`Processing ${inlineDetailQueue.length} detail pages inline...`);
+            const categoryUrl = request.url;
+
+            for (const { url: detailUrl, listingData } of inlineDetailQueue) {
+                if (maxItems !== null && scrapedItemsCount >= maxItems) {
+                    log.info(`Maximum items limit reached. Stopping detail processing.`);
+                    await crawler.autoscaledPool?.abort();
+                    return;
+                }
+
+                await randomDelay(3000, 6000);
+                log.info(`Navigating inline to detail page: ${detailUrl}`);
+
+                try {
+                    const detailResponse = await page.goto(detailUrl, {
+                        waitUntil: 'networkidle2',
+                        timeout: 90000,
+                    });
+                    const detailStatus = detailResponse?.status();
+                    log.info(`Detail page status: ${detailStatus} for ${detailUrl}`);
+
+                    if (detailStatus === 403 || detailStatus === 503 || detailStatus === 429) {
+                        await randomDelay(3000, 6000);
+                        const content = await page.content();
+
+                        if (isPxHoldChallenge(content)) {
+                            log.info('PX hold challenge on detail page — attempting hold...');
+                            await saveDebugInfo(page, 'detail-px-hold');
+                            const solved = await tryHoldPxButton(page);
+                            if (!solved) {
+                                log.warning(`PX hold failed for ${detailUrl} — skipping.`);
+                                await saveDebugInfo(page, 'detail-px-hold-failed');
+                                // Navigate back to known-good page to restore browser state
+                                await page.goto(categoryUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+                                continue;
+                            }
+                        } else if (isChallengedPage(content)) {
+                            log.info('CF challenge on detail page — waiting for auto-resolution...');
+                            await saveDebugInfo(page, 'detail-cf-challenge');
+                            try {
+                                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
+                                const resolvedContent = await page.content();
+                                if (isChallengedPage(resolvedContent) || isPxHoldChallenge(resolvedContent)) {
+                                    log.warning(`CF challenge not resolved for ${detailUrl} — skipping.`);
+                                    await saveDebugInfo(page, 'detail-cf-unresolved');
+                                    await page.goto(categoryUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+                                    continue;
+                                }
+                                log.info('CF challenge resolved for detail page.');
+                            } catch (e) {
+                                log.warning(`CF challenge timeout for ${detailUrl} — skipping.`);
+                                await page.goto(categoryUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+                                continue;
+                            }
+                        } else {
+                            log.warning(`Detail page blocked (${detailStatus}) without challenge: ${detailUrl} — skipping.`);
+                            await saveDebugInfo(page, `detail-blocked-${detailStatus}`);
+                            continue;
+                        }
+                    }
+
+                    // Check for login redirect
+                    if (page.url().includes('/giris') || page.url().includes('secure.sahibinden.com')) {
+                        log.error('Redirected to login on detail page. Session cookies may be expired.');
+                        await crawler.autoscaledPool?.abort();
+                        return;
+                    }
+
+                    await handleDetailPage(page, { url: detailUrl, userData: { listingData } });
+
+                } catch (e) {
+                    log.warning(`Failed to load detail page ${detailUrl}: ${e.message}`);
+                }
+            }
+        }
+
+        if (maxItems !== null && scrapedItemsCount >= maxItems) {
+            log.info(`Maximum items limit (${maxItems}) reached after detail processing.`);
+            await crawler.autoscaledPool?.abort();
         }
 
     } catch (error) {
