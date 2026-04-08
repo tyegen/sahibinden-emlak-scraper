@@ -805,33 +805,41 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
                 log.info(`Clicking link to detail page: ${detailUrl}`);
 
                 try {
-                    // Find the link by listing ID (works for both relative and absolute href attributes)
+                    // Target the visible title link in the results table specifically.
+                    // Generic a[href*=id] can match hidden anchors (image overlays, etc.)
                     const listingId = extractListingId(detailUrl);
-                    const linkHandle = await page.$(`a[href*="/${listingId}/"]`).catch(() => null)
-                        ?? await page.$(`a[href*="${listingId}"]`).catch(() => null);
+                    const titleSelector = `td.searchResultsTitleValue a[href*="${listingId}"]`;
+                    const fallbackSelector = `a.classifiedTitle[href*="${listingId}"]`;
+
+                    let linkHandle = await page.$(titleSelector).catch(() => null)
+                        ?? await page.$(fallbackSelector).catch(() => null);
 
                     if (!linkHandle) {
-                        log.warning(`Could not find link for ${detailUrl} on category page — skipping.`);
+                        log.warning(`Could not find title link for ${detailUrl} — skipping.`);
                         continue;
                     }
 
-                    // Scroll the link into view and simulate natural mouse movement
+                    // Scroll the link into view and wait for it to become visible
                     await linkHandle.evaluate(el => el.scrollIntoView({ behavior: 'smooth', block: 'center' }));
-                    await randomDelay(400, 900);
+                    await randomDelay(600, 1200);
 
+                    // Get bounding box and move mouse naturally to the link
                     const box = await linkHandle.boundingBox().catch(() => null);
-                    if (box) {
-                        const cx = box.x + box.width / 2;
-                        const cy = box.y + box.height / 2;
-                        await page.mouse.move(cx - 30, cy - 15, { steps: 8 });
-                        await randomDelay(100, 300);
-                        await page.mouse.move(cx, cy, { steps: 5 });
-                        await randomDelay(80, 200);
+                    if (!box || box.width === 0) {
+                        log.warning(`Link has no bounding box for ${detailUrl} — skipping.`);
+                        continue;
                     }
+
+                    const cx = box.x + box.width / 2;
+                    const cy = box.y + box.height / 2;
+                    await page.mouse.move(cx - 40, cy - 20, { steps: 10 });
+                    await randomDelay(150, 350);
+                    await page.mouse.move(cx, cy, { steps: 6 });
+                    await randomDelay(100, 200);
 
                     const [navResponse] = await Promise.all([
                         page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 90000 }),
-                        linkHandle.click(),
+                        page.mouse.click(cx, cy),
                     ]);
                     onCategoryPage = false;
 
