@@ -579,7 +579,7 @@ const crawler = new PuppeteerCrawler({
             if (label === 'DETAIL') {
                 await handleDetailPage(page, request);
             } else {
-                await handleCategoryPage(page, request, enqueueLinks);
+                await handleCategoryPage(page, request, enqueueLinks, session);
             }
 
         } catch (error) {
@@ -614,7 +614,7 @@ if (originalThrowOnBlocked) {
 // =============================================
 // CATEGORY PAGE HANDLER
 // =============================================
-async function handleCategoryPage(page, request, enqueueLinks) {
+async function handleCategoryPage(page, request, enqueueLinks, session) {
     log.info(`Handling category page: ${request.url}`);
 
     const listingRowSelector = 'tbody.searchResultsRowClass > tr.searchResultsItem';
@@ -782,6 +782,30 @@ async function handleCategoryPage(page, request, enqueueLinks) {
             log.info(`Processing ${inlineDetailQueue.length} detail pages inline...`);
             const categoryUrl = request.url;
 
+            // Build the header set for detail page navigations (same-origin from category).
+            // IMPORTANT: page.setExtraHTTPHeaders() persists across navigations.
+            // The category page preNavigationHook set Sec-Fetch-Site: none — we must
+            // override that now so inline detail navigations look like same-origin clicks.
+            const sessionUA = session?.userData?.userAgent;
+            const chromeVerMatchInline = sessionUA?.match(/Chrome\/(\d+)/);
+            const detailNavHeaders = {
+                'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1',
+                'Referer': categoryUrl,
+            };
+            if (chromeVerMatchInline) {
+                const v = chromeVerMatchInline[1];
+                detailNavHeaders['sec-ch-ua'] = `"Not A(Brand";v="99", "Google Chrome";v="${v}", "Chromium";v="${v}"`;
+                detailNavHeaders['sec-ch-ua-mobile'] = '?0';
+                detailNavHeaders['sec-ch-ua-platform'] = '"Windows"';
+            }
+            await page.setExtraHTTPHeaders(detailNavHeaders);
+
             for (const { url: detailUrl, listingData } of inlineDetailQueue) {
                 if (maxItems !== null && scrapedItemsCount >= maxItems) {
                     log.info(`Maximum items limit reached. Stopping detail processing.`);
@@ -792,12 +816,22 @@ async function handleCategoryPage(page, request, enqueueLinks) {
                 await randomDelay(3000, 6000);
                 log.info(`Navigating inline to detail page: ${detailUrl}`);
 
+                // Update Referer to the current page URL before each navigation.
+                // window.location.href assignment is used instead of page.goto() so the
+                // browser treats it as a same-origin navigation and sets Referer automatically.
                 try {
-                    const detailResponse = await page.goto(detailUrl, {
-                        waitUntil: 'networkidle2',
-                        timeout: 90000,
-                    });
-                    const detailStatus = detailResponse?.status();
+                    const currentPageUrl = page.url();
+                    await page.setExtraHTTPHeaders({ ...detailNavHeaders, 'Referer': currentPageUrl });
+
+                    const [detailResponse] = await Promise.all([
+                        page.waitForResponse(
+                            resp => resp.url() === detailUrl || resp.url().startsWith(detailUrl),
+                            { timeout: 90000 }
+                        ).catch(() => null),
+                        page.evaluate((url) => { window.location.href = url; }, detailUrl),
+                    ]);
+                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 90000 }).catch(() => {});
+                    const detailStatus = detailResponse?.status() ?? (await page.evaluate(() => 200));
                     log.info(`Detail page status: ${detailStatus} for ${detailUrl}`);
 
                     if (detailStatus === 403 || detailStatus === 503 || detailStatus === 429) {
