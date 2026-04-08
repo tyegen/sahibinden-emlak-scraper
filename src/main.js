@@ -579,7 +579,7 @@ const crawler = new PuppeteerCrawler({
             if (label === 'DETAIL') {
                 await handleDetailPage(page, request);
             } else {
-                await handleCategoryPage(page, request, enqueueLinks, session);
+                await handleCategoryPage(page, request, enqueueLinks);
             }
 
         } catch (error) {
@@ -776,35 +776,14 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
             }
         }
 
-        // Process detail pages inline using the same browser tab.
-        // This keeps CF's trusted browser context alive across all detail navigations.
+        // Process detail pages via in-page fetch() — NOT page navigation.
+        // CF's interactive challenge (Turnstile) is only triggered by top-level
+        // navigation requests (Sec-Fetch-Mode: navigate). A fetch() from a trusted
+        // page context sends Sec-Fetch-Mode: cors and will not receive a challenge
+        // page — the browser session cookies (cf_clearance, _px3, etc.) are sent
+        // automatically with credentials:'include', which should pass CF's checks.
         if (inlineDetailQueue.length > 0) {
-            log.info(`Processing ${inlineDetailQueue.length} detail pages inline...`);
-            const categoryUrl = request.url;
-
-            // Build the header set for detail page navigations (same-origin from category).
-            // IMPORTANT: page.setExtraHTTPHeaders() persists across navigations.
-            // The category page preNavigationHook set Sec-Fetch-Site: none — we must
-            // override that now so inline detail navigations look like same-origin clicks.
-            const sessionUA = session?.userData?.userAgent;
-            const chromeVerMatchInline = sessionUA?.match(/Chrome\/(\d+)/);
-            const detailNavHeaders = {
-                'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'same-origin',
-                'Sec-Fetch-User': '?1',
-                'Upgrade-Insecure-Requests': '1',
-                'Referer': categoryUrl,
-            };
-            if (chromeVerMatchInline) {
-                const v = chromeVerMatchInline[1];
-                detailNavHeaders['sec-ch-ua'] = `"Not A(Brand";v="99", "Google Chrome";v="${v}", "Chromium";v="${v}"`;
-                detailNavHeaders['sec-ch-ua-mobile'] = '?0';
-                detailNavHeaders['sec-ch-ua-platform'] = '"Windows"';
-            }
-            await page.setExtraHTTPHeaders(detailNavHeaders);
+            log.info(`Fetching ${inlineDetailQueue.length} detail pages via in-page fetch...`);
 
             for (const { url: detailUrl, listingData } of inlineDetailQueue) {
                 if (maxItems !== null && scrapedItemsCount >= maxItems) {
@@ -813,78 +792,104 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
                     return;
                 }
 
-                await randomDelay(3000, 6000);
-                log.info(`Navigating inline to detail page: ${detailUrl}`);
+                await randomDelay(2000, 4000);
+                log.info(`Fetching detail: ${detailUrl}`);
 
-                // Update Referer to the current page URL before each navigation.
-                // window.location.href assignment is used instead of page.goto() so the
-                // browser treats it as a same-origin navigation and sets Referer automatically.
                 try {
-                    const currentPageUrl = page.url();
-                    await page.setExtraHTTPHeaders({ ...detailNavHeaders, 'Referer': currentPageUrl });
+                    // Execute fetch inside the browser page context so all session cookies,
+                    // TLS fingerprint, and browser state are inherited automatically.
+                    const detailRaw = await page.evaluate(async (url) => {
+                        try {
+                            const resp = await fetch(url, {
+                                method: 'GET',
+                                credentials: 'include',
+                                headers: {
+                                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                                    'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+                                },
+                            });
 
-                    const [detailResponse] = await Promise.all([
-                        page.waitForResponse(
-                            resp => resp.url() === detailUrl || resp.url().startsWith(detailUrl),
-                            { timeout: 90000 }
-                        ).catch(() => null),
-                        page.evaluate((url) => { window.location.href = url; }, detailUrl),
-                    ]);
-                    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 90000 }).catch(() => {});
-                    const detailStatus = detailResponse?.status() ?? (await page.evaluate(() => 200));
-                    log.info(`Detail page status: ${detailStatus} for ${detailUrl}`);
+                            if (!resp.ok) return { status: resp.status, ok: false };
 
-                    if (detailStatus === 403 || detailStatus === 503 || detailStatus === 429) {
-                        await randomDelay(3000, 6000);
-                        const content = await page.content();
+                            const html = await resp.text();
+                            const parser = new DOMParser();
+                            const doc = parser.parseFromString(html, 'text/html');
 
-                        if (isPxHoldChallenge(content)) {
-                            log.info('PX hold challenge on detail page — attempting hold...');
-                            await saveDebugInfo(page, 'detail-px-hold');
-                            const solved = await tryHoldPxButton(page);
-                            if (!solved) {
-                                log.warning(`PX hold failed for ${detailUrl} — skipping.`);
-                                await saveDebugInfo(page, 'detail-px-hold-failed');
-                                // Navigate back to known-good page to restore browser state
-                                await page.goto(categoryUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
-                                continue;
-                            }
-                        } else if (isChallengedPage(content)) {
-                            log.info('CF challenge on detail page — waiting for auto-resolution...');
-                            await saveDebugInfo(page, 'detail-cf-challenge');
-                            try {
-                                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
-                                const resolvedContent = await page.content();
-                                if (isChallengedPage(resolvedContent) || isPxHoldChallenge(resolvedContent)) {
-                                    log.warning(`CF challenge not resolved for ${detailUrl} — skipping.`);
-                                    await saveDebugInfo(page, 'detail-cf-unresolved');
-                                    await page.goto(categoryUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
-                                    continue;
-                                }
-                                log.info('CF challenge resolved for detail page.');
-                            } catch (e) {
-                                log.warning(`CF challenge timeout for ${detailUrl} — skipping.`);
-                                await page.goto(categoryUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
-                                continue;
-                            }
-                        } else {
-                            log.warning(`Detail page blocked (${detailStatus}) without challenge: ${detailUrl} — skipping.`);
-                            await saveDebugInfo(page, `detail-blocked-${detailStatus}`);
-                            continue;
+                            const getText = (sel) => doc.querySelector(sel)?.textContent?.trim() || '';
+
+                            const info = {};
+                            doc.querySelectorAll('.classifiedInfoList li').forEach(item => {
+                                const label = item.querySelector('strong')?.textContent?.trim();
+                                const value = item.querySelector('span')?.textContent?.trim();
+                                if (label && value) info[label] = value;
+                            });
+
+                            const images = [...new Set(
+                                Array.from(doc.querySelectorAll(
+                                    '.classifiedDetailMainPhoto img, .swiper-slide img, #classifiedDetailPhotos img'
+                                ))
+                                    .map(img => img.getAttribute('src') || img.getAttribute('data-src'))
+                                    .filter(s => s && s.startsWith('http'))
+                            )];
+
+                            return {
+                                ok: true,
+                                status: resp.status,
+                                description: getText('#classifiedDescription'),
+                                seller: getText('.classifiedUserContent h5') || getText('.classifiedOtherBoxes .username-info-area') || null,
+                                pageId: getText('.classifiedId').replace(/[^0-9]/g, '') || null,
+                                info,
+                                images,
+                            };
+                        } catch (e) {
+                            return { ok: false, error: e.message };
+                        }
+                    }, detailUrl);
+
+                    if (!detailRaw.ok) {
+                        log.warning(`Detail fetch failed for ${detailUrl}: HTTP ${detailRaw.status ?? detailRaw.error}`);
+                        if (debugMode) await saveDebugInfo(page, `detail-fetch-failed-${detailRaw.status}`);
+                        continue;
+                    }
+
+                    log.info(`Detail fetch OK (${detailRaw.images.length} images, ${detailRaw.description.length} chars desc)`);
+
+                    const info = detailRaw.info;
+                    const completeData = {
+                        ...listingData,
+                        id: listingData.id || detailRaw.pageId || extractListingId(detailUrl),
+                        description: normalizeText(detailRaw.description),
+                        images: detailRaw.images,
+                        seller: detailRaw.seller ? normalizeText(detailRaw.seller) : null,
+                        info: Object.fromEntries(
+                            Object.entries(info).map(([k, v]) => [normalizeText(k), normalizeText(v)])
+                        ),
+                        size: info['Brüt / Net M2'] || info['m² (Brüt)'] || info['m² (Net)'] || null,
+                        rooms: info['Oda Sayısı'] || null,
+                        buildingAge: info['Bina Yaşı'] || null,
+                        floor: info['Bulunduğu Kat'] || null,
+                        totalFloors: info['Kat Sayısı'] || null,
+                        heating: info['Isınma'] || null,
+                        furnished: info['Eşyalı'] || null,
+                        usage: info['Kullanım Durumu'] || null,
+                        inSite: info['Site İçinde'] || null,
+                        dues: info['Aidat'] || null,
+                        deedStatus: info['Tapu Durumu'] || null,
+                        creditEligible: info['Krediye Uygun'] || null,
+                    };
+
+                    await Actor.pushData(completeData);
+                    scrapedItemsCount++;
+                    log.info(`Pushed detail for ${completeData.id}. Total: ${scrapedItemsCount}`);
+
+                    if (baseRowIntegration) {
+                        try { await baseRowIntegration.storeListing(completeData); } catch (e) {
+                            log.warning('Failed to store detail in BaseRow', { error: e.message });
                         }
                     }
 
-                    // Check for login redirect
-                    if (page.url().includes('/giris') || page.url().includes('secure.sahibinden.com')) {
-                        log.error('Redirected to login on detail page. Session cookies may be expired.');
-                        await crawler.autoscaledPool?.abort();
-                        return;
-                    }
-
-                    await handleDetailPage(page, { url: detailUrl, userData: { listingData } });
-
                 } catch (e) {
-                    log.warning(`Failed to load detail page ${detailUrl}: ${e.message}`);
+                    log.warning(`Detail fetch error for ${detailUrl}: ${e.message}`);
                 }
             }
         }
