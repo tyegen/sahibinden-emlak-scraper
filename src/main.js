@@ -372,15 +372,26 @@ const crawler = new PuppeteerCrawler({
             // Derive sec-ch-ua version from the UA string so they stay consistent.
             // Only Chrome/Edge UAs send sec-ch-ua; skip the header for Firefox/Safari.
             const chromeVerMatch = ua.match(/Chrome\/(\d+)/);
+
+            // For detail pages, simulate a same-origin navigation from the category page.
+            // CF checks Sec-Fetch-Site and Referer — a direct navigation ('none') to a
+            // /ilan/*/detay URL is highly suspicious; same-origin navigation is normal.
+            const requestLabel = request.userData?.label;
+            const isDetailPage = requestLabel === 'DETAIL';
+            const sourceUrl = request.userData?.listingData?.sourceUrl;
+
             const extraHeaders = {
                 'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-Site': isDetailPage ? 'same-origin' : 'none',
                 'Sec-Fetch-User': '?1',
                 'Upgrade-Insecure-Requests': '1',
             };
+            if (isDetailPage && sourceUrl) {
+                extraHeaders['Referer'] = sourceUrl;
+            }
             if (chromeVerMatch) {
                 const v = chromeVerMatch[1];
                 extraHeaders['sec-ch-ua'] = `"Not A(Brand";v="99", "Google Chrome";v="${v}", "Chromium";v="${v}"`;
@@ -388,6 +399,11 @@ const crawler = new PuppeteerCrawler({
                 extraHeaders['sec-ch-ua-platform'] = '"Windows"';
             }
             await page.setExtraHTTPHeaders(extraHeaders);
+
+            // Extra delay before detail pages — burst of navigations triggers CF/PX rate limits.
+            if (isDetailPage) {
+                await randomDelay(4000, 8000);
+            }
 
             await page.setViewport({ width: 1920, height: 1080 });
 
