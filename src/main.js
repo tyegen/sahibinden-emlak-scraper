@@ -261,10 +261,13 @@ const crawler = new PuppeteerCrawler({
 
     preNavigationHooks: [
         async ({ page, request, session }, gotoOptions) => {
-            // Inject session cookies — filter expired ones first.
-            // Sending an expired cf_clearance to Cloudflare is worse than sending none.
+            // Inject user-provided session cookies — but only ONCE per session.
+            // After the first request, CF/PX set fresh cookies in the browser.
+            // Re-injecting on every request overwrites those fresh cookies with older
+            // originals, breaking subsequent requests (e.g. detail pages after category).
             const nowSecs = Date.now() / 1000;
-            if (sessionCookies && Array.isArray(sessionCookies) && sessionCookies.length > 0) {
+            const alreadyInjected = session?.userData?.cookiesInjected === true;
+            if (!alreadyInjected && sessionCookies && Array.isArray(sessionCookies) && sessionCookies.length > 0) {
                 try {
                     const validCookies = sessionCookies.filter(c => {
                         const expiry = c.expirationDate ?? c.expires ?? null;
@@ -292,12 +295,15 @@ const crawler = new PuppeteerCrawler({
                         }));
                         await page.setCookie(...formattedCookies);
                         log.info(`Injected ${formattedCookies.length} valid session cookies: ${formattedCookies.map(c => c.name).join(', ')}`);
+                        if (session) session.userData = { ...session.userData, cookiesInjected: true };
                     } else {
                         log.warning('All provided sessionCookies were expired — none injected. Please export fresh cookies from your browser.');
                     }
                 } catch (e) {
                     log.warning(`Failed to inject session cookies: ${e.message}`);
                 }
+            } else if (alreadyInjected) {
+                log.debug('Session already has cookies from previous request — skipping re-injection to preserve fresh CF/PX cookies.');
             }
 
             // Check if we have a valid cf_clearance (from either input cookies or session pool)
