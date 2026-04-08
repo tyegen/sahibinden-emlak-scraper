@@ -210,10 +210,17 @@ async function saveDebugInfo(page, label) {
     } catch (e) { }
 }
 
+// When includeDetails is on, detail pages must be fetched one at a time.
+// Concurrent detail requests trigger CF/PX blocks immediately.
+const effectiveConcurrency = includeDetails ? 1 : maxConcurrency;
+if (includeDetails && maxConcurrency > 1) {
+    log.info(`includeDetails is enabled — reducing concurrency to 1 to avoid CF/PX blocks on detail pages.`);
+}
+
 // Create the Puppeteer crawler
 const crawler = new PuppeteerCrawler({
     proxyConfiguration: proxyConfig,
-    maxConcurrency,
+    maxConcurrency: effectiveConcurrency,
     maxRequestsPerCrawl: maxItems ? maxItems * 3 : 1000,
     maxRequestRetries: 8,
     navigationTimeoutSecs: 90,
