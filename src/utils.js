@@ -106,7 +106,12 @@ export function parseYesNo(value) {
  */
 export function normalizeText(text) {
     if (!text) return '';
-    return text.replace(/\s+/g, ' ').trim();
+    let result = text.replace(/\s+/g, ' ').trim();
+    // Fix UTF-8 bytes misread as Latin-1 (mojibake) — common with Turkish characters
+    // e.g. "Ã¼" (C3 BC read as Latin-1) → "ü" (correct UTF-8)
+    // Already-correct Unicode strings throw in decodeURIComponent and are returned as-is.
+    try { result = decodeURIComponent(escape(result)); } catch (e) { }
+    return result;
 }
 
 /**
