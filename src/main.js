@@ -358,9 +358,21 @@ const crawler = new PuppeteerCrawler({
                 log.debug('Valid cf_clearance present, skipping pre-warm.');
             }
 
-            const ua = randomUserAgent();
+            // Use a stable user agent for this session.
+            // cf_clearance is tied to the UA that earned it — changing UA between requests
+            // (category page → detail pages) causes CF to challenge every detail page.
+            let ua = session?.userData?.userAgent;
+            if (!ua) {
+                ua = randomUserAgent();
+                if (session) session.userData = { ...session.userData, userAgent: ua };
+                log.debug(`Assigned user agent for session: ${ua}`);
+            }
             await page.setUserAgent(ua);
-            await page.setExtraHTTPHeaders({
+
+            // Derive sec-ch-ua version from the UA string so they stay consistent.
+            // Only Chrome/Edge UAs send sec-ch-ua; skip the header for Firefox/Safari.
+            const chromeVerMatch = ua.match(/Chrome\/(\d+)/);
+            const extraHeaders = {
                 'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                 'Sec-Fetch-Dest': 'document',
@@ -368,10 +380,14 @@ const crawler = new PuppeteerCrawler({
                 'Sec-Fetch-Site': 'none',
                 'Sec-Fetch-User': '?1',
                 'Upgrade-Insecure-Requests': '1',
-                'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-            });
+            };
+            if (chromeVerMatch) {
+                const v = chromeVerMatch[1];
+                extraHeaders['sec-ch-ua'] = `"Not A(Brand";v="99", "Google Chrome";v="${v}", "Chromium";v="${v}"`;
+                extraHeaders['sec-ch-ua-mobile'] = '?0';
+                extraHeaders['sec-ch-ua-platform'] = '"Windows"';
+            }
+            await page.setExtraHTTPHeaders(extraHeaders);
 
             await page.setViewport({ width: 1920, height: 1080 });
 
