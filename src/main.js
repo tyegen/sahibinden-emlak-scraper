@@ -805,9 +805,10 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
                 log.info(`Clicking link to detail page: ${detailUrl}`);
 
                 try {
-                    // Find the link element on the category page using the detail URL
-                    const linkHandle = await page.$(`a[href="${detailUrl}"]`).catch(() => null)
-                        ?? await page.$(`a.classifiedTitle[href*="${extractListingId(detailUrl)}"]`).catch(() => null);
+                    // Find the link by listing ID (works for both relative and absolute href attributes)
+                    const listingId = extractListingId(detailUrl);
+                    const linkHandle = await page.$(`a[href*="/${listingId}/"]`).catch(() => null)
+                        ?? await page.$(`a[href*="${listingId}"]`).catch(() => null);
 
                     if (!linkHandle) {
                         log.warning(`Could not find link for ${detailUrl} on category page — skipping.`);
