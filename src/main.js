@@ -24,7 +24,6 @@ const input = await Actor.getInput() || {};
 const {
     startUrls = [{ url: 'https://www.sahibinden.com/satilik-daire/istanbul?sorting=date_desc' }],
     maxItems = null,
-    includeDetails = false,
     maxConcurrency = 3,
     proxyConfiguration = {
         useApifyProxy: true,
@@ -60,7 +59,6 @@ const hasPxCookies = ['_px3', '_pxhd', '_pxvid', 'pxcts'].some(n => cookieNames.
 log.info('Starting Sahibinden Emlak Scraper', {
     startUrls: startUrls.map(u => typeof u === 'string' ? u : u.url),
     maxItems,
-    includeDetails,
     maxConcurrency,
     proxyGroups: finalProxyConfiguration.apifyProxyGroups,
     countryCode: finalProxyConfiguration.countryCode,
@@ -210,17 +208,10 @@ async function saveDebugInfo(page, label) {
     } catch (e) { }
 }
 
-// When includeDetails is on, detail pages must be fetched one at a time.
-// Concurrent detail requests trigger CF/PX blocks immediately.
-const effectiveConcurrency = includeDetails ? 1 : maxConcurrency;
-if (includeDetails && maxConcurrency > 1) {
-    log.info(`includeDetails is enabled — reducing concurrency to 1 to avoid CF/PX blocks on detail pages.`);
-}
-
 // Create the Puppeteer crawler
 const crawler = new PuppeteerCrawler({
     proxyConfiguration: proxyConfig,
-    maxConcurrency: effectiveConcurrency,
+    maxConcurrency: maxConcurrency,
     maxRequestsPerCrawl: maxItems ? maxItems * 3 : 1000,
     maxRequestRetries: 8,
     navigationTimeoutSecs: 90,
@@ -567,7 +558,7 @@ const crawler = new PuppeteerCrawler({
         },
     ],
 
-    requestHandler: async ({ page, request, enqueueLinks, session }) => {
+    requestHandler: async ({ page, request, enqueueLinks }) => {
         const label = request.userData?.label || 'CATEGORY';
         log.info(`Processing page [${label}]: ${request.url}`);
 
@@ -576,11 +567,7 @@ const crawler = new PuppeteerCrawler({
         try {
             await page.waitForSelector('body', { timeout: 45000 });
 
-            if (label === 'DETAIL') {
-                await handleDetailPage(page, request);
-            } else {
-                await handleCategoryPage(page, request, enqueueLinks);
-            }
+            await handleCategoryPage(page, request, enqueueLinks);
 
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -614,12 +601,14 @@ if (originalThrowOnBlocked) {
 // =============================================
 // CATEGORY PAGE HANDLER
 // =============================================
-async function handleCategoryPage(page, request, enqueueLinks, session) {
+async function handleCategoryPage(page, request, enqueueLinks) {
     log.info(`Handling category page: ${request.url}`);
 
     const listingRowSelector = 'tbody.searchResultsRowClass > tr.searchResultsItem';
     const titleLinkSelector = 'td.searchResultsTitleValue a.classifiedTitle';
     const priceSelector = 'td.searchResultsPriceValue span';
+    const pricePerSqmSelector = 'td.searchResultsPriceValue:nth-of-type(2)';
+    const areaSelector = 'td.searchResultsAttributeValue';
     const dateSelector = 'td.searchResultsDateValue';
     const locationSelector = 'td.searchResultsLocationValue';
     const nextPageSelector = 'a.prevNextBut[title="Sonraki"]:not(.passive)';
@@ -686,12 +675,6 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
         log.info(`Found ${listingElements.length} listings on page.`);
 
         const results = [];
-        // When includeDetails=true, collect detail URLs here and process them inline
-        // (same browser tab) rather than via Crawlee's queue.
-        // Reason: CF already trusts the browser context that loaded the category page.
-        // Navigating to detail URLs via the queue creates a fresh context per request,
-        // which CF challenges every time. Inline page.goto() reuses the trusted context.
-        const inlineDetailQueue = [];
 
         for (const element of listingElements) {
             if (maxItems !== null && scrapedItemsCount >= maxItems) {
@@ -719,10 +702,14 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
                 }
 
                 const priceText = await element.$eval(priceSelector, el => el.textContent?.trim()).catch(() => null);
+                const pricePerSqmText = await element.$eval(pricePerSqmSelector, el => el.textContent?.trim()).catch(() => null);
+                const areaText = await element.$eval(areaSelector, el => el.textContent?.trim()).catch(() => null);
                 const location = await element.$eval(locationSelector, el => el.innerText?.trim().replace(/\n/g, ' / ')).catch(() => null);
                 const date = await element.$eval(dateSelector, el => el.innerText?.trim().replace(/\n/g, ' ')).catch(() => null);
                 const image = await element.$eval('img', el => el.src || el.dataset?.src || null).catch(() => null);
-                const id = extractListingId(detailUrl);
+                // Use data-id attribute directly — more reliable than regex on the URL
+                const id = await element.evaluate(el => el.getAttribute('data-id')).catch(() => null)
+                    ?? extractListingId(detailUrl);
 
                 const listingData = {
                     id,
@@ -731,6 +718,8 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
                     price: formatPrice(priceText),
                     price_currency: extractCurrency(priceText),
                     price_raw: priceText,
+                    price_per_sqm: normalizeText(pricePerSqmText),
+                    area: normalizeText(areaText),
                     location: normalizeText(location),
                     date: normalizeText(date),
                     image,
@@ -738,12 +727,8 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
                     sourceUrl: request.url,
                 };
 
-                if (includeDetails && detailUrl) {
-                    inlineDetailQueue.push({ url: detailUrl, listingData });
-                } else {
-                    results.push(listingData);
-                    scrapedItemsCount++;
-                }
+                results.push(listingData);
+                scrapedItemsCount++;
 
             } catch (extractError) {
                 const errorMsg = extractError instanceof Error ? extractError.message : String(extractError);
@@ -759,7 +744,7 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
                     log.warning('Failed to store data in BaseRow', { error: error.message });
                 }
             }
-        } else if (!includeDetails) {
+        } else {
             log.info(`No listings extracted from page ${request.url}.`);
         }
 
@@ -776,130 +761,6 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
             }
         }
 
-        // Process detail pages by clicking the actual listing links on the category page.
-        // element.click() is the most authentic navigation: it generates real mouse events,
-        // sets Sec-Fetch-User:?1 (user gesture), and the browser sets Referer automatically.
-        // After each detail page we use page.goBack() to return to the category page.
-        if (inlineDetailQueue.length > 0) {
-            log.info(`Processing ${inlineDetailQueue.length} detail pages via link clicks...`);
-            const categoryUrl = request.url;
-            let onCategoryPage = true;
-
-            for (const { url: detailUrl, listingData } of inlineDetailQueue) {
-                if (maxItems !== null && scrapedItemsCount >= maxItems) {
-                    log.info(`Maximum items limit reached. Stopping detail processing.`);
-                    await crawler.autoscaledPool?.abort();
-                    return;
-                }
-
-                // Return to category page if we navigated away
-                if (!onCategoryPage) {
-                    await randomDelay(2000, 4000);
-                    log.debug(`Returning to category page: ${categoryUrl}`);
-                    await page.goto(categoryUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
-                    onCategoryPage = true;
-                    await randomDelay(1000, 2000);
-                }
-
-                await randomDelay(1500, 3500);
-                log.info(`Clicking link to detail page: ${detailUrl}`);
-
-                try {
-                    // Target the visible title link in the results table specifically.
-                    // Generic a[href*=id] can match hidden anchors (image overlays, etc.)
-                    const listingId = extractListingId(detailUrl);
-                    const titleSelector = `td.searchResultsTitleValue a[href*="${listingId}"]`;
-                    const fallbackSelector = `a.classifiedTitle[href*="${listingId}"]`;
-
-                    let linkHandle = await page.$(titleSelector).catch(() => null)
-                        ?? await page.$(fallbackSelector).catch(() => null);
-
-                    if (!linkHandle) {
-                        log.warning(`Could not find title link for ${detailUrl} — skipping.`);
-                        continue;
-                    }
-
-                    // Scroll the link into view and wait for it to become visible
-                    await linkHandle.evaluate(el => el.scrollIntoView({ behavior: 'smooth', block: 'center' }));
-                    await randomDelay(600, 1200);
-
-                    // Get bounding box and move mouse naturally to the link
-                    const box = await linkHandle.boundingBox().catch(() => null);
-                    if (!box || box.width === 0) {
-                        log.warning(`Link has no bounding box for ${detailUrl} — skipping.`);
-                        continue;
-                    }
-
-                    const cx = box.x + box.width / 2;
-                    const cy = box.y + box.height / 2;
-                    await page.mouse.move(cx - 40, cy - 20, { steps: 10 });
-                    await randomDelay(150, 350);
-                    await page.mouse.move(cx, cy, { steps: 6 });
-                    await randomDelay(100, 200);
-
-                    const [navResponse] = await Promise.all([
-                        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 90000 }),
-                        page.mouse.click(cx, cy),
-                    ]);
-                    onCategoryPage = false;
-
-                    const detailStatus = navResponse?.status();
-                    log.info(`Detail page status: ${detailStatus} for ${detailUrl}`);
-
-                    if (detailStatus === 403 || detailStatus === 503 || detailStatus === 429) {
-                        await randomDelay(3000, 6000);
-                        const content = await page.content();
-
-                        if (isPxHoldChallenge(content)) {
-                            log.info('PX hold challenge on detail page — attempting hold...');
-                            await saveDebugInfo(page, 'detail-px-hold');
-                            const solved = await tryHoldPxButton(page);
-                            if (!solved) {
-                                log.warning(`PX hold failed for ${detailUrl} — skipping.`);
-                                continue;
-                            }
-                        } else if (isChallengedPage(content)) {
-                            log.info('CF challenge on detail page — waiting for auto-resolution...');
-                            await saveDebugInfo(page, 'detail-cf-challenge');
-                            try {
-                                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
-                                const resolvedContent = await page.content();
-                                // Only treat as failed if very specific CF/PX challenge indicators are present.
-                                // Avoid false positives from generic Turkish text.
-                                const stillChallenged = resolvedContent.includes('challenge-platform')
-                                    || resolvedContent.includes('cf-browser-verification')
-                                    || isPxHoldChallenge(resolvedContent);
-                                if (stillChallenged) {
-                                    log.warning(`CF challenge not resolved for ${detailUrl} — skipping.`);
-                                    await saveDebugInfo(page, 'detail-cf-unresolved');
-                                    continue;
-                                }
-                                log.info('CF challenge resolved for detail page.');
-                            } catch (e) {
-                                log.warning(`CF challenge timeout for ${detailUrl} — skipping.`);
-                                continue;
-                            }
-                        } else {
-                            log.warning(`Detail blocked (${detailStatus}) without challenge: ${detailUrl} — skipping.`);
-                            await saveDebugInfo(page, `detail-blocked-${detailStatus}`);
-                            continue;
-                        }
-                    }
-
-                    if (page.url().includes('/giris') || page.url().includes('secure.sahibinden.com')) {
-                        log.error('Redirected to login on detail page. Session cookies may be expired.');
-                        await crawler.autoscaledPool?.abort();
-                        return;
-                    }
-
-                    await handleDetailPage(page, { url: detailUrl, userData: { listingData } });
-
-                } catch (e) {
-                    log.warning(`Detail click error for ${detailUrl}: ${e.message}`);
-                }
-            }
-        }
-
         if (maxItems !== null && scrapedItemsCount >= maxItems) {
             log.info(`Maximum items limit (${maxItems}) reached after detail processing.`);
             await crawler.autoscaledPool?.abort();
@@ -908,92 +769,6 @@ async function handleCategoryPage(page, request, enqueueLinks, session) {
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         log.warning(`Could not handle category page ${request.url}: ${errorMessage}`);
-    }
-}
-
-// =============================================
-// DETAIL PAGE HANDLER
-// =============================================
-async function handleDetailPage(page, request) {
-    log.info(`Handling detail page: ${request.url}`);
-
-    const listingData = request.userData?.listingData || {};
-
-    try {
-        await page.waitForSelector('body', { timeout: 30000 });
-        await randomDelay(1000, 3000);
-
-        const description = await page.$eval('#classifiedDescription', el => el.textContent?.trim() || '').catch(() => '');
-
-        const info = {};
-        try {
-            const infoItems = await page.$$('.classifiedInfoList li');
-            for (const item of infoItems) {
-                const label = await item.$eval('strong', el => el.textContent?.trim()).catch(() => null);
-                const value = await item.$eval('span', el => el.textContent?.trim()).catch(() => null);
-                if (label && value) info[normalizeText(label)] = normalizeText(value);
-            }
-        } catch (e) {
-            log.debug('Could not extract info list', { error: e.message });
-        }
-
-        const images = await page.$$eval(
-            '.classifiedDetailMainPhoto img, .swiper-slide img, #classifiedDetailPhotos img',
-            imgs => imgs.map(img => img.src || img.dataset?.src).filter(Boolean)
-        ).catch(() => []);
-
-        const uniqueImages = [...new Set(images)];
-
-        const seller = await page.$eval(
-            '.classifiedUserContent h5, .classifiedOtherBoxes .username-info-area',
-            el => el.textContent?.trim()
-        ).catch(() => null);
-
-        const pageId = await page.$eval('.classifiedId', el => el.textContent?.replace(/[^0-9]/g, '')).catch(() => null);
-
-        const completeData = {
-            ...listingData,
-            id: listingData.id || pageId || extractListingId(request.url),
-            description: normalizeText(description),
-            images: uniqueImages,
-            seller: seller ? normalizeText(seller) : null,
-            info,
-            size: info['Brüt / Net M2'] || info['m² (Brüt)'] || info['m² (Net)'] || null,
-            rooms: info['Oda Sayısı'] || null,
-            buildingAge: info['Bina Yaşı'] || null,
-            floor: info['Bulunduğu Kat'] || null,
-            totalFloors: info['Kat Sayısı'] || null,
-            heating: info['Isınma'] || null,
-            furnished: info['Eşyalı'] || null,
-            usage: info['Kullanım Durumu'] || null,
-            inSite: info['Site İçinde'] || null,
-            dues: info['Aidat'] || null,
-            deedStatus: info['Tapu Durumu'] || null,
-            creditEligible: info['Krediye Uygun'] || null,
-        };
-
-        await Actor.pushData(completeData);
-        scrapedItemsCount++;
-        log.info(`Pushed detail data for listing ${completeData.id}. Total scraped: ${scrapedItemsCount}`);
-
-        if (baseRowIntegration) {
-            try { await baseRowIntegration.storeListing(completeData); } catch (error) {
-                log.warning('Failed to store detail data in BaseRow', { error: error.message });
-            }
-        }
-
-        if (maxItems !== null && scrapedItemsCount >= maxItems) {
-            log.info(`Maximum items limit (${maxItems}) reached.`);
-            await crawler.autoscaledPool?.abort();
-        }
-
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        log.warning(`Could not handle detail page ${request.url}: ${errorMessage}`);
-        if (listingData.title) {
-            await Actor.pushData(listingData);
-            scrapedItemsCount++;
-        }
     }
 }
 

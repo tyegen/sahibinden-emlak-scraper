@@ -23,12 +23,6 @@
             "sectionCaption": "Scraper Settings",
             "sectionDescription": "Configure the scraper's execution parameters."
         },
-        "includeDetails": {
-            "title": "Include Details",
-            "type": "boolean",
-            "description": "If true, it will open each listing's detail page to extract description, all properties, photos, and owner info. If false, it only extracts basic info from the list page.",
-            "default": false
-        },
         "maxConcurrency": {
             "title": "Max Concurrency",
             "type": "integer",
