@@ -260,17 +260,24 @@ const crawler = new PuppeteerCrawler({
             const alreadyInjected = session?.userData?.cookiesInjected === true;
             if (!alreadyInjected && sessionCookies && Array.isArray(sessionCookies) && sessionCookies.length > 0) {
                 try {
-                    const validCookies = sessionCookies.filter(c => {
-                        const expiry = c.expirationDate ?? c.expires ?? null;
-                        if (expiry && expiry < nowSecs) {
-                            log.debug(`Skipping expired cookie: ${c.name}`);
-                            return false;
-                        }
-                        return true;
-                    });
+                    const validCookies = sessionCookies
+                        // Normalize: some exporters use 'key' instead of 'name'
+                        .map(c => ({ ...c, name: c.name ?? c.key ?? null }))
+                        .filter(c => {
+                            if (!c.name) {
+                                log.debug('Skipping cookie with null/missing name field.');
+                                return false;
+                            }
+                            const expiry = c.expirationDate ?? c.expires ?? null;
+                            if (expiry && expiry < nowSecs) {
+                                log.debug(`Skipping expired cookie: ${c.name}`);
+                                return false;
+                            }
+                            return true;
+                        });
 
                     if (validCookies.length < sessionCookies.length) {
-                        log.warning(`Filtered ${sessionCookies.length - validCookies.length} expired cookies. ` +
+                        log.warning(`Filtered ${sessionCookies.length - validCookies.length} invalid/expired cookies. ` +
                             `If cf_clearance expired, the scraper will earn a fresh one via session pre-warm.`);
                     }
 
