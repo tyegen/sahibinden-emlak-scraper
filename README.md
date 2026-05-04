@@ -1,5 +1,19 @@
 # Sahibinden Real Estate Scraper 🏠
 
+## 🤖 Copy to your AI assistant
+Copy this block into ChatGPT, Claude, Cursor, or any LLM to start using this actor.
+
+```text
+tyegen/sahibinden-real-estate-scraper on Apify. Call: ApifyClient("TOKEN").actor("tyegen/sahibinden-real-estate-scraper").call(run_input={"startUrls": [{"url": "URL_HERE"}]}), then client.dataset(run["defaultDatasetId"]).list_items().items for results.
+```
+
+> **🚨 CRITICAL REQUIREMENT FOR USERS: SESSION COOKIES 🚨**
+> 
+> Sahibinden.com has extremely aggressive anti-bot protection and frequently redirects new proxy IPs to a mandatory login page. 
+> 
+> **To prevent constant TIMEOUTS or empty results, you MUST inject your personal Session Cookie into the actor's input.** 
+> Use an extension like `EditThisCookie` to export your session from a real browser and paste it into the `sessionCookies` field before running.
+
 A powerful Apify Actor that scrapes real estate listings from Sahibinden.com (Turkey's largest classified ads platform). Extracts property details including price, location, size, rooms, building age, and more.
 
 ## Features
